@@ -1,4 +1,5 @@
 import { IsString, IsOptional, IsArray, IsObject } from 'class-validator';
+import type { OutlineGroup } from '../../proposal/proposal-outline.util';
 
 export class OutlineDto {
   @IsOptional()
@@ -6,8 +7,8 @@ export class OutlineDto {
   tenderOutline?: string;
 
   @IsOptional()
-  techOutlineSections?: Array<{ group: string; sections: Array<{ name: string; detail?: string }> }>;
+  techOutlineSections?: OutlineGroup[];
 
   @IsOptional()
-  bizOutlineSections?: Array<{ group: string; sections: Array<{ name: string; detail?: string }> }>;
+  bizOutlineSections?: OutlineGroup[];
 }

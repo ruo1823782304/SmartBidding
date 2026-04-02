@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ComponentType } from "react";
+import { useEffect, useMemo, useRef, useState, type ComponentType, type Dispatch, type SetStateAction } from "react";
 import {
   AlertTriangle,
   BarChart3,
@@ -8,6 +8,7 @@ import {
   Clock3,
   Eye,
   EyeOff,
+  ExternalLink,
   FileCheck2,
   FileText,
   Filter,
@@ -47,6 +48,7 @@ import {
   DropdownMenuTrigger,
 } from "./components/ui/dropdown-menu";
 import { Input } from "./components/ui/input";
+import { Textarea } from "./components/ui/textarea";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "./components/ui/tabs";
 import { Toaster } from "./components/ui/sonner";
 import {
@@ -58,11 +60,48 @@ import {
   TableRow,
 } from "./components/ui/table";
 import { BidLibraryManager, type BidLibraryItem } from "./components/BidLibraryManager";
-import { TenderAnalyzer, type TenderRequirement } from "./components/TenderAnalyzer";
+import { ConnectedTenderPage } from "./components/ConnectedTenderPage";
+import { EnterpriseLibraryPage } from "./components/EnterpriseLibraryPage";
+import { ProposalWorkspace } from "./components/ProposalWorkspace";
+import { fetchComplianceRecommendations } from "./lib/compliance-workflow";
+import {
+  AI_PROVIDER_CONFIGS,
+  buildProviderPreviewJson,
+  buildEmptyModelConfig,
+  getProviderConfig,
+  inferProviderByModel,
+  loadRemoteModelConfig,
+  parseRemoteCodingPlan,
+  saveRemoteModelConfig,
+  verifyRemoteProviderConfig,
+  type ModelConfig,
+  type ModelProvider,
+} from "./lib/model-config-workflow";
+import type {
+  TenderAnalysisCompletePayload,
+  TenderParsedCategory,
+  TenderRequirement,
+} from "./types/tender";
+import type {
+  ComplianceRecommendationResult,
+  ComplianceSuggestionSection,
+  ComplianceSuggestionSectionKey,
+  ComplianceSuggestionSeverity,
+} from "./types/compliance";
+import type { AssetCategory } from "./types/asset-library";
 
 type AuthView = "login" | "register" | "forgot" | "maintenance";
-type PageKey = "home" | "asset" | "tender" | "proposal" | "collaboration" | "data-center" | "compliance" | "personal";
-type AssetCategory = "qualification" | "performance" | "solution" | "archive" | "winning" | "resume";
+type PageKey =
+  | "home"
+  | "asset"
+  | "tender"
+  | "proposal"
+  | "collaboration"
+  | "data-center"
+  | "compliance"
+  | "personal"
+  | "personnel-settings"
+  | "model-config";
 type Role =
   | "管理员"
   | "技术标制作人"
@@ -89,15 +128,6 @@ type Project = {
   deadline: string;
   progress: string;
   type: string;
-};
-
-type ModelConfig = {
-  codingPlan: string;
-  selectedModel: string;
-  openaiKey: string;
-  qwenKey: string;
-  deepseekKey: string;
-  baichuanKey: string;
 };
 
 type ProjectContext = {
@@ -216,10 +246,142 @@ const proposalOutline: { group: string; sections: { name: string; detail: string
   },
 ];
 
+const APP_STATE_STORAGE_KEY = "smart-bid.app-state";
+
+const DEFAULT_PROJECT_CONTEXT: ProjectContext = {
+  activeProjectId: "proj-default",
+  projectName: "银行监管报送平台",
+  tenderFile: null,
+  tenderRequirements: [],
+  tenderOutline: "",
+  lastParsedAt: null,
+  proposalCompletedSections: 0,
+  proposalTotalSections: proposalOutline.flatMap((g) => g.sections).length,
+};
+
+type PersistedAppState = {
+  isAuthed: boolean;
+  session: UserSession | null;
+  remoteProjectId: string | null;
+  uploadedTender: ProjectContext["tenderFile"];
+  projectContext: ProjectContext;
+  activePage: PageKey;
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function readStoredTenderFile(value: unknown): ProjectContext["tenderFile"] {
+  if (!isRecord(value)) {
+    return null;
+  }
+
+  const name = typeof value.name === "string" ? value.name : "";
+  const size = typeof value.size === "string" ? value.size : "";
+  const format = typeof value.format === "string" ? value.format : "";
+  return name && size && format ? { name, size, format } : null;
+}
+
+function readStoredProjectContext(value: unknown): ProjectContext {
+  if (!isRecord(value)) {
+    return DEFAULT_PROJECT_CONTEXT;
+  }
+
+  return {
+    activeProjectId:
+      typeof value.activeProjectId === "string" && value.activeProjectId.trim()
+        ? value.activeProjectId
+        : DEFAULT_PROJECT_CONTEXT.activeProjectId,
+    projectName:
+      typeof value.projectName === "string" && value.projectName.trim()
+        ? value.projectName
+        : DEFAULT_PROJECT_CONTEXT.projectName,
+    tenderFile: readStoredTenderFile(value.tenderFile),
+    tenderRequirements: Array.isArray(value.tenderRequirements) ? (value.tenderRequirements as TenderRequirement[]) : [],
+    tenderOutline: typeof value.tenderOutline === "string" ? value.tenderOutline : "",
+    lastParsedAt: typeof value.lastParsedAt === "string" ? value.lastParsedAt : null,
+    proposalCompletedSections:
+      typeof value.proposalCompletedSections === "number" ? value.proposalCompletedSections : 0,
+    proposalTotalSections:
+      typeof value.proposalTotalSections === "number"
+        ? value.proposalTotalSections
+        : DEFAULT_PROJECT_CONTEXT.proposalTotalSections,
+  };
+}
+
+function readPersistedAppState(): PersistedAppState | null {
+  if (typeof window === "undefined") {
+    return null;
+  }
+
+  try {
+    const raw = window.localStorage.getItem(APP_STATE_STORAGE_KEY);
+    if (!raw) {
+      return null;
+    }
+
+    const parsed = JSON.parse(raw) as unknown;
+    if (!isRecord(parsed)) {
+      return null;
+    }
+
+    const session =
+      isRecord(parsed.session)
+      && typeof parsed.session.username === "string"
+      && typeof parsed.session.role === "string"
+        ? {
+            username: parsed.session.username,
+            role: parsed.session.role as Role,
+          }
+        : null;
+    const projectContext = readStoredProjectContext(parsed.projectContext);
+    let activePage: PageKey = "home";
+    if (typeof parsed.activePage === "string" && parsed.activePage.trim()) {
+      activePage = parsed.activePage as PageKey;
+    }
+    if (activePage === "tender" && projectContext.lastParsedAt && projectContext.activeProjectId !== "proj-default") {
+      activePage = "proposal";
+    }
+
+    return {
+      isAuthed: parsed.isAuthed === true && Boolean(session),
+      session,
+      remoteProjectId:
+        typeof parsed.remoteProjectId === "string" && parsed.remoteProjectId.trim()
+          ? parsed.remoteProjectId
+          : null,
+      uploadedTender: readStoredTenderFile(parsed.uploadedTender),
+      projectContext,
+      activePage,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function persistAppState(nextState: PersistedAppState | null) {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  if (!nextState) {
+    window.localStorage.removeItem(APP_STATE_STORAGE_KEY);
+    return;
+  }
+
+  window.localStorage.setItem(APP_STATE_STORAGE_KEY, JSON.stringify(nextState));
+}
+
 function App() {
+  const persistedAppStateRef = useRef<PersistedAppState | null>(null);
+  if (persistedAppStateRef.current === null) {
+    persistedAppStateRef.current = readPersistedAppState();
+  }
+  const persistedAppState = persistedAppStateRef.current;
   const [authView, setAuthView] = useState<AuthView>("login");
-  const [isAuthed, setIsAuthed] = useState(false);
-  const [session, setSession] = useState<UserSession | null>(null);
+  const [isAuthed, setIsAuthed] = useState(persistedAppState?.isAuthed ?? false);
+  const [session, setSession] = useState<UserSession | null>(persistedAppState?.session ?? null);
   const [accounts, setAccounts] = useState<UserAccount[]>([
     { username: "admin", password: "admin", role: "管理员" },
     { username: "tech01", password: "123456", role: "技术标制作人" },
@@ -236,21 +398,13 @@ function App() {
   const [registerConfirmPwd, setRegisterConfirmPwd] = useState("");
   const [registerRole, setRegisterRole] = useState<Role>("机动人员");
 
-  const [activePage, setActivePage] = useState<PageKey>("home");
+  const [activePage, setActivePage] = useState<PageKey>(persistedAppState?.activePage ?? "home");
   const [searchValue, setSearchValue] = useState("");
-  const [activeAssetCategory, setActiveAssetCategory] = useState<AssetCategory>("qualification");
-  const [configOpen, setConfigOpen] = useState(false);
+  const [activeAssetCategory, setActiveAssetCategory] = useState<AssetCategory>("ingest");
   const [maintenanceOpen, setMaintenanceOpen] = useState(false);
   const [projectTypeFilter, setProjectTypeFilter] = useState("全部");
 
-  const [modelConfig, setModelConfig] = useState<ModelConfig>({
-    codingPlan: "",
-    selectedModel: "gpt-4o",
-    openaiKey: "",
-    qwenKey: "",
-    deepseekKey: "",
-    baichuanKey: "",
-  });
+  const [modelConfig, setModelConfig] = useState<ModelConfig>(buildEmptyModelConfig());
 
   const [board, setBoard] = useState<Record<string, Project[]>>({
     pending: [
@@ -266,28 +420,40 @@ function App() {
   });
   const [dragMeta, setDragMeta] = useState<{ from: string; projectId: string } | null>(null);
 
-  const [uploadedTender, setUploadedTender] = useState<{ name: string; size: string; format: string } | null>(null);
-  const [parseProgress, setParseProgress] = useState(0);
-  const [isParsing, setIsParsing] = useState(false);
+  const [uploadedTender, setUploadedTender] = useState<{ name: string; size: string; format: string } | null>(
+    persistedAppState?.uploadedTender ?? null,
+  );
+  const [remoteProjectId, setRemoteProjectId] = useState<string | null>(persistedAppState?.remoteProjectId ?? null);
+  const [tenderCategories, setTenderCategories] = useState<TenderParsedCategory[]>([]);
   const [libraryItems, setLibraryItems] = useState<BidLibraryItem[]>([]);
-  const [projectContext, setProjectContext] = useState<ProjectContext>({
-    activeProjectId: "proj-default",
-    projectName: "银行监管报送平台",
-    tenderFile: null,
-    tenderRequirements: [],
-    tenderOutline: "",
-    lastParsedAt: null,
-    proposalCompletedSections: 0,
-    proposalTotalSections: proposalOutline.flatMap((g) => g.sections).length,
-  });
+  const [projectContext, setProjectContext] = useState<ProjectContext>(
+    persistedAppState?.projectContext ?? DEFAULT_PROJECT_CONTEXT,
+  );
 
   const permissions = session ? rolePermissions[session.role] : rolePermissions["机动人员"];
-  const pageVisible = (page: PageKey) => permissions.pages.includes(page);
+  const pageVisible = (page: PageKey) =>
+    permissions.pages.includes(page) || page === "personnel-settings" || page === "model-config";
 
   useEffect(() => {
     if (!isAuthed) return;
     if (!pageVisible(activePage)) setActivePage("home");
   }, [activePage, isAuthed, session]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (!isAuthed || !session) {
+      persistAppState(null);
+      return;
+    }
+
+    persistAppState({
+      isAuthed: true,
+      session,
+      remoteProjectId,
+      uploadedTender,
+      projectContext,
+      activePage,
+    });
+  }, [activePage, isAuthed, projectContext, remoteProjectId, session, uploadedTender]);
 
   const suggestList = useMemo(() => {
     if (!searchValue.trim()) return [];
@@ -381,6 +547,20 @@ function App() {
     setRegisterConfirmPwd("");
   };
 
+  const handleLogout = () => {
+    persistAppState(null);
+    setIsAuthed(false);
+    setSession(null);
+    setRemoteProjectId(null);
+    setUploadedTender(null);
+    setTenderCategories([]);
+    setProjectContext(DEFAULT_PROJECT_CONTEXT);
+    setActivePage("home");
+    setAuthView("login");
+    setLoginPassword("");
+    toast.success("已退出登录");
+  };
+
   const handleDrop = (toColumn: string) => {
     if (!dragMeta) return;
     const source = board[dragMeta.from];
@@ -396,43 +576,19 @@ function App() {
     toast.success("项目拖拽排序已更新");
   };
 
-  const triggerParse = () => {
-    if (!uploadedTender) {
-      toast.error("请先上传招标文件");
-      return;
-    }
-    setIsParsing(true);
-    setParseProgress(0);
-    const timer = setInterval(() => {
-      setParseProgress((prev) => {
-        if (prev >= 100) {
-          clearInterval(timer);
-          setIsParsing(false);
-          setProjectContext((ctx) => ({
-            ...ctx,
-            tenderFile: uploadedTender,
-            lastParsedAt: new Date().toISOString(),
-          }));
-          toast.success("招标文件解析完成");
-          return 100;
-        }
-        return prev + 20;
-      });
-    }, 220);
-  };
-
-  const handleTenderAnalysisComplete = (requirements: TenderRequirement[]) => {
-    const draftOutline = [
-      "投标大纲：",
-      ...requirements.slice(0, 8).map((req, idx) => `${idx + 1}. ${req.title}`),
-    ].join("\n");
+  const handleTenderAnalysisComplete = (payload: TenderAnalysisCompletePayload) => {
+    setRemoteProjectId(payload.remoteProjectId);
+    setUploadedTender(payload.uploadedTender);
+    setTenderCategories(payload.categories.filter((category) => category.key !== "other"));
     setProjectContext((ctx) => ({
       ...ctx,
-      tenderRequirements: requirements,
-      tenderOutline: draftOutline,
-      lastParsedAt: new Date().toISOString(),
+      activeProjectId: payload.remoteProjectId,
+      tenderFile: payload.uploadedTender,
+      tenderRequirements: payload.requirements,
+      tenderOutline: payload.outline,
+      lastParsedAt: payload.parsedAt,
     }));
-    toast.success(`已同步 ${requirements.length} 条招标要求到项目上下文`);
+    toast.success(`已同步 ${payload.requirements.length} 条招标要求到项目上下文`);
   };
 
   if (!isAuthed) {
@@ -685,10 +841,10 @@ function App() {
     <div className="flex min-h-screen bg-[#F5F7FA] text-[#303133]">
       <Toaster />
 
-      {/* 左侧导航栏 240px Mac OS 侧边栏风格 */}
-      <aside className="fixed left-0 top-0 z-40 h-screen w-[240px] flex-col border-r border-[#E4E7ED] bg-[#F5F7FA] flex">
+      {/* 左侧导航栏收窄，给主工作区释放更多横向空间 */}
+      <aside className="fixed left-0 top-0 z-40 flex h-screen w-[216px] flex-col border-r border-[#E4E7ED] bg-[#F5F7FA]">
         <div className="flex flex-1 flex-col overflow-y-auto py-4">
-          <div className="px-5 pb-2">
+          <div className="px-4 pb-2">
             <button
               type="button"
               onClick={() => setActivePage("home")}
@@ -698,8 +854,8 @@ function App() {
               <span className="text-lg font-bold text-[#165DFF]">智能标书库</span>
             </button>
           </div>
-          <p className="px-5 pt-4 pb-2 text-xs font-medium uppercase tracking-wider text-[#909399]">MENU</p>
-          <nav className="space-y-0.5 px-3">
+          <p className="px-4 pb-2 pt-4 text-xs font-medium uppercase tracking-wider text-[#909399]">MENU</p>
+          <nav className="space-y-0.5 px-2.5">
             {[
               { key: "tender" as PageKey, label: "标书解析", icon: FileCheck2 },
               { key: "proposal" as PageKey, label: "标书编制", icon: FileText },
@@ -716,7 +872,7 @@ function App() {
                     key={item.key}
                     type="button"
                     onClick={() => setActivePage(item.key)}
-                    className={`flex h-10 w-full items-center gap-2 rounded-[8px] px-5 text-sm transition-colors ${
+                    className={`flex h-10 w-full items-center gap-2 rounded-[8px] px-4 text-sm transition-colors ${
                       active
                         ? "bg-[#165DFF] text-white"
                         : "text-[#303133] hover:bg-[#E4E7ED]"
@@ -728,12 +884,12 @@ function App() {
                 );
               })}
           </nav>
-          <p className="px-5 pt-6 pb-2 text-xs font-medium uppercase tracking-wider text-[#909399]">ACCOUNT</p>
-          <nav className="space-y-0.5 px-3">
+          <p className="px-4 pb-2 pt-6 text-xs font-medium uppercase tracking-wider text-[#909399]">ACCOUNT</p>
+          <nav className="space-y-0.5 px-2.5">
             <button
               type="button"
               onClick={() => setActivePage("personal")}
-              className={`flex h-10 w-full items-center gap-2 rounded-[8px] px-5 text-sm hover:bg-[#E4E7ED] ${
+              className={`flex h-10 w-full items-center gap-2 rounded-[8px] px-4 text-sm hover:bg-[#E4E7ED] ${
                 activePage === "personal" ? "bg-[#E8F0FF] text-[#165DFF]" : "text-[#303133]"
               }`}
             >
@@ -743,26 +899,38 @@ function App() {
             <button
               type="button"
               onClick={() => setMaintenanceOpen(true)}
-              className="flex h-10 w-full items-center gap-2 rounded-[8px] px-5 text-sm text-[#303133] hover:bg-[#E4E7ED]"
+              className="flex h-10 w-full items-center gap-2 rounded-[8px] px-4 text-sm text-[#303133] hover:bg-[#E4E7ED]"
             >
               <Settings2 className="h-4 w-4 shrink-0" />
               编辑资料
             </button>
           </nav>
-          <p className="px-5 pt-6 pb-2 text-xs font-medium uppercase tracking-wider text-[#909399]">OTHER</p>
-          <nav className="space-y-0.5 px-3">
+          <p className="px-4 pb-2 pt-6 text-xs font-medium uppercase tracking-wider text-[#909399]">OTHER</p>
+          <nav className="space-y-0.5 px-2.5">
             <button
               type="button"
-              onClick={() => setConfigOpen(true)}
-              className="flex h-10 w-full items-center gap-2 rounded-[8px] px-5 text-sm text-[#303133] hover:bg-[#E4E7ED]"
+              onClick={() => setActivePage("personnel-settings")}
+              className={`flex h-10 w-full items-center gap-2 rounded-[8px] px-4 text-sm transition-colors ${
+                activePage === "personnel-settings" ? "bg-[#E8F0FF] text-[#165DFF]" : "text-[#303133] hover:bg-[#E4E7ED]"
+              }`}
+            >
+              <Users className="h-4 w-4 shrink-0" />
+              人员配置
+            </button>
+            <button
+              type="button"
+              onClick={() => setActivePage("model-config")}
+              className={`flex h-10 w-full items-center gap-2 rounded-[8px] px-4 text-sm transition-colors ${
+                activePage === "model-config" ? "bg-[#E8F0FF] text-[#165DFF]" : "text-[#303133] hover:bg-[#E4E7ED]"
+              }`}
             >
               <Settings2 className="h-4 w-4 shrink-0" />
-              设置
+              模型配置
             </button>
             <button
               type="button"
               onClick={() => toast.info("帮助文档（敬请期待）")}
-              className="flex h-10 w-full items-center gap-2 rounded-[8px] px-5 text-sm text-[#303133] hover:bg-[#E4E7ED]"
+              className="flex h-10 w-full items-center gap-2 rounded-[8px] px-4 text-sm text-[#303133] hover:bg-[#E4E7ED]"
             >
               <HelpCircle className="h-4 w-4 shrink-0" />
               帮助
@@ -771,10 +939,10 @@ function App() {
         </div>
       </aside>
 
-      <div className="flex min-h-screen flex-1 flex-col pl-[240px]">
+      <div className="flex min-h-screen flex-1 flex-col pl-[216px]">
         {/* 顶部导航栏 64px 磨砂玻璃 */}
         {/* 顶部导航栏 64px 磨砂玻璃 */}
-        <header className="fixed top-0 left-[240px] right-0 z-30 flex h-16 items-center border-b border-[#E4E7ED]/50 bg-[rgba(255,255,255,0.9)] px-5 shadow-[0_2px_12px_rgba(0,0,0,0.05)] backdrop-blur-md">
+        <header className="fixed left-[216px] right-0 top-0 z-30 flex h-16 items-center border-b border-[#E4E7ED]/50 bg-[rgba(255,255,255,0.9)] px-5 shadow-[0_2px_12px_rgba(0,0,0,0.05)] backdrop-blur-md">
           <div className="mx-auto flex h-full w-full max-w-[1400px] items-center gap-4">
             <Button
               variant="ghost"
@@ -817,7 +985,7 @@ function App() {
               variant="ghost"
               size="sm"
               className="h-9 rounded-[8px] gap-1.5 text-[#303133] hover:bg-[#F0F2F5]"
-              onClick={() => setConfigOpen(true)}
+              onClick={() => setActivePage("model-config")}
             >
               <Settings2 className="h-4 w-4" />
               配置
@@ -843,14 +1011,7 @@ function App() {
                 <DropdownMenuItem onClick={() => setMaintenanceOpen(true)}>个人设置</DropdownMenuItem>
                 <DropdownMenuItem onClick={() => setActivePage("collaboration")}>我的任务</DropdownMenuItem>
                 <DropdownMenuSeparator />
-                <DropdownMenuItem
-                  onClick={() => {
-                    setIsAuthed(false);
-                    setSession(null);
-                    setAuthView("login");
-                    toast.success("已退出登录");
-                  }}
-                >
+                <DropdownMenuItem onClick={handleLogout}>
                   退出登录
                 </DropdownMenuItem>
               </DropdownMenuContent>
@@ -883,31 +1044,36 @@ function App() {
             onLibraryUpdate={setLibraryItems}
           />
         )}
-        {activePage === "tender" && (
-          <TenderPage
-            uploadedTender={uploadedTender}
-            onUploadTender={(fileMeta) => {
-              setUploadedTender(fileMeta);
-              setProjectContext((ctx) => ({ ...ctx, tenderFile: fileMeta }));
-            }}
-            parseProgress={parseProgress}
-            isParsing={isParsing}
-            onParse={triggerParse}
-            onGoCompliance={() => setActivePage("compliance")}
-            onNextStep={() => setActivePage("proposal")}
-            onAnalysisComplete={handleTenderAnalysisComplete}
-          />
+        {pageVisible("tender") && (
+          <div hidden={activePage !== "tender"}>
+            <TenderPage
+              projectName={projectContext.projectName}
+              remoteProjectId={remoteProjectId}
+              uploadedTender={uploadedTender}
+              initialCategories={tenderCategories}
+              onGoCompliance={() => setActivePage("compliance")}
+              onNextStep={() => setActivePage("proposal")}
+              onAnalysisComplete={handleTenderAnalysisComplete}
+            />
+          </div>
         )}
-        {activePage === "proposal" && (
-          <ProposalPage
-            projectContext={projectContext}
-            onProjectContextUpdate={(next) => setProjectContext((ctx) => ({ ...ctx, ...next }))}
-          />
+        {pageVisible("proposal") && (
+          <div hidden={activePage !== "proposal"}>
+            <ProposalWorkspace
+              projectContext={projectContext}
+              onProjectContextUpdate={(next) => setProjectContext((ctx) => ({ ...ctx, ...next }))}
+            />
+          </div>
         )}
         {activePage === "collaboration" && (
           <CollaborationPage role={session?.role ?? "机动人员"} projectContext={projectContext} />
         )}
-        {activePage === "compliance" && <CompliancePage />}
+        {activePage === "compliance" && (
+          <CompliancePage
+            projectContext={projectContext}
+            onGoProposal={() => setActivePage("proposal")}
+          />
+        )}
         {activePage === "data-center" && <DataCenterPage projectContext={projectContext} />}
         {activePage === "personal" && (
           <PersonalCenterPage
@@ -915,102 +1081,16 @@ function App() {
             onGoToPending={() => setActivePage("collaboration")}
           />
         )}
+        {activePage === "personnel-settings" && (
+          <PersonnelSettingsPage session={session} />
+        )}
+        {activePage === "model-config" && (
+          <UnifiedModelConfigPage
+            modelConfig={modelConfig}
+            onModelConfigChange={setModelConfig}
+          />
+        )}
       </main>
-
-      <Dialog open={configOpen} onOpenChange={setConfigOpen}>
-        <DialogContent className="max-w-3xl rounded-[12px] border-[#E4E7ED] bg-[rgba(255,255,255,0.98)] p-6 shadow-[0_4px_20px_rgba(0,0,0,0.08)]">
-          <DialogHeader>
-            <DialogTitle>系统配置</DialogTitle>
-            <DialogDescription>包含人员配置（仅查看当前角色）和模型配置（coding plan、API-Key、模型切换）。</DialogDescription>
-          </DialogHeader>
-          <Tabs defaultValue="personnel">
-            <TabsList className="grid w-full grid-cols-2">
-              <TabsTrigger value="personnel">人员配置</TabsTrigger>
-              <TabsTrigger value="model">模型配置页</TabsTrigger>
-            </TabsList>
-            <TabsContent value="personnel" className="mt-3">
-              <Card>
-                <CardHeader className="pb-2">
-                  <CardTitle className="text-sm">当前角色与权限</CardTitle>
-                </CardHeader>
-                <CardContent className="space-y-2 text-sm">
-                  <p>当前用户：{session?.username}</p>
-                  <p>当前角色：{session?.role}</p>
-                  <p className="text-slate-600">{session ? rolePermissions[session.role].description : ""}</p>
-                  <div className="flex flex-wrap gap-2 pt-1">
-                    {(session ? rolePermissions[session.role].pages : []).map((page) => (
-                      <Badge key={page} variant="secondary">
-                        {page}
-                      </Badge>
-                    ))}
-                  </div>
-                </CardContent>
-              </Card>
-            </TabsContent>
-            <TabsContent value="model" className="mt-3">
-              <Card>
-                <CardHeader className="pb-2">
-                  <CardTitle className="text-sm">大模型参数配置（实时生效）</CardTitle>
-                </CardHeader>
-                <CardContent className="space-y-3">
-                  <div>
-                    <p className="mb-1 text-xs text-slate-500">Coding Plan</p>
-                    <textarea
-                      className="h-20 w-full rounded-md border p-2 text-sm"
-                      value={modelConfig.codingPlan}
-                      onChange={(e) => setModelConfig((prev) => ({ ...prev, codingPlan: e.target.value }))}
-                      placeholder="输入本次标书生成策略与计划..."
-                    />
-                  </div>
-                  <div>
-                    <p className="mb-1 text-xs text-slate-500">模型切换</p>
-                    <select
-                      className="h-9 w-full rounded-md border px-2 text-sm"
-                      value={modelConfig.selectedModel}
-                      onChange={(e) => setModelConfig((prev) => ({ ...prev, selectedModel: e.target.value }))}
-                    >
-                      <option>gpt-4o</option>
-                      <option>deepseek-chat</option>
-                      <option>qwen-plus</option>
-                      <option>baichuan4</option>
-                    </select>
-                  </div>
-                  <Input
-                    value={modelConfig.openaiKey}
-                    onChange={(e) => setModelConfig((prev) => ({ ...prev, openaiKey: e.target.value }))}
-                    placeholder="OpenAI API-Key"
-                  />
-                  <Input
-                    value={modelConfig.qwenKey}
-                    onChange={(e) => setModelConfig((prev) => ({ ...prev, qwenKey: e.target.value }))}
-                    placeholder="通义千问 API-Key"
-                  />
-                  <Input
-                    value={modelConfig.deepseekKey}
-                    onChange={(e) => setModelConfig((prev) => ({ ...prev, deepseekKey: e.target.value }))}
-                    placeholder="DeepSeek API-Key"
-                  />
-                  <Input
-                    value={modelConfig.baichuanKey}
-                    onChange={(e) => setModelConfig((prev) => ({ ...prev, baichuanKey: e.target.value }))}
-                    placeholder="百川 API-Key"
-                  />
-                </CardContent>
-              </Card>
-            </TabsContent>
-          </Tabs>
-          <DialogFooter>
-            <Button
-              onClick={() => {
-                toast.success(`模型已切换为 ${modelConfig.selectedModel}，配置已生效`);
-                setConfigOpen(false);
-              }}
-            >
-              保存配置
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
 
       <Dialog open={maintenanceOpen} onOpenChange={setMaintenanceOpen}>
         <DialogContent className="max-w-md rounded-[12px] border-[#E4E7ED] bg-[rgba(255,255,255,0.98)] p-6 shadow-[0_4px_20px_rgba(0,0,0,0.08)]">
@@ -1044,6 +1124,1292 @@ function App() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+      </div>
+    </div>
+  );
+}
+
+function PersonnelSettingsPage({
+  session,
+}: {
+  session: UserSession | null;
+}) {
+  return (
+    <div className="mx-auto w-full max-w-[1200px] space-y-5">
+      <div className="flex items-center justify-between">
+        <div>
+          <h2 className="text-2xl font-semibold text-[#303133]">人员配置</h2>
+          <p className="mt-1 text-sm text-[#909399]">参考原页面展示当前用户、角色说明与可访问页面</p>
+        </div>
+      </div>
+      <Card className="rounded-[12px] border-[#E4E7ED] bg-white shadow-[0_4px_20px_rgba(0,0,0,0.06)]">
+        <CardHeader className="pb-2">
+          <CardTitle className="text-base">当前角色与权限</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-3 text-sm">
+          <p>当前用户：{session?.username ?? "-"}</p>
+          <p>当前角色：{session?.role ?? "-"}</p>
+          <p className="text-[#909399]">{session ? rolePermissions[session.role].description : ""}</p>
+          <div className="flex flex-wrap gap-2 pt-1">
+            {(session ? rolePermissions[session.role].pages : []).map((page) => (
+              <Badge key={page} variant="secondary">
+                {page}
+              </Badge>
+            ))}
+          </div>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+function UnifiedModelConfigPage({
+  modelConfig,
+  onModelConfigChange,
+}: {
+  modelConfig: ModelConfig;
+  onModelConfigChange: Dispatch<SetStateAction<ModelConfig>>;
+}) {
+  const [activeConfigTab, setActiveConfigTab] = useState<"provider-config" | "coding-plan">("provider-config");
+  const [isLoading, setIsLoading] = useState(true);
+  const [isParsingPlan, setIsParsingPlan] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+  const [isApplying, setIsApplying] = useState(false);
+  const [showCodingPlanKey, setShowCodingPlanKey] = useState(false);
+  const [showProviderKey, setShowProviderKey] = useState(false);
+  const [verificationSummary, setVerificationSummary] = useState("");
+  const [verifiedProviderId, setVerifiedProviderId] = useState("");
+  const activeProviderConfig = getProviderConfig(modelConfig.activeProvider);
+  const supportedProviders = useMemo(
+    () => new Set(modelConfig.supportedModels.map((item) => inferProviderByModel(item))),
+    [modelConfig.supportedModels],
+  );
+  const providerPreviewJson = useMemo(
+    () =>
+      buildProviderPreviewJson(
+        activeProviderConfig,
+        modelConfig[activeProviderConfig.keyField],
+        modelConfig.selectedModel || activeProviderConfig.model,
+      ),
+    [activeProviderConfig, modelConfig],
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadConfig = async () => {
+      try {
+        const remoteConfig = await loadRemoteModelConfig();
+        if (!cancelled) {
+          onModelConfigChange(remoteConfig);
+          setVerifiedProviderId("");
+          setVerificationSummary("");
+        }
+      } catch (error) {
+        if (!cancelled) {
+          const message = error instanceof Error ? error.message : "模型配置加载失败";
+          toast.error(message);
+        }
+      } finally {
+        if (!cancelled) {
+          setIsLoading(false);
+        }
+      }
+    };
+
+    loadConfig();
+    return () => {
+      cancelled = true;
+    };
+  }, [onModelConfigChange]);
+
+  const updateActiveProvider = (provider: ModelProvider) => {
+    const providerConfig = getProviderConfig(provider);
+    const supportedModel = modelConfig.supportedModels.find((item) => inferProviderByModel(item) === provider);
+    onModelConfigChange((prev) => ({
+      ...prev,
+      activeProvider: provider,
+      selectedModel: supportedModel ?? providerConfig.model,
+    }));
+    setVerifiedProviderId("");
+    setVerificationSummary("");
+    setShowProviderKey(false);
+  };
+
+  const updateActiveProviderKey = (value: string) => {
+    onModelConfigChange((prev) => ({
+      ...prev,
+      [activeProviderConfig.keyField]: value,
+    }));
+    setVerifiedProviderId("");
+    setVerificationSummary("");
+  };
+
+  const updateSelectedModel = (model: string) => {
+    onModelConfigChange((prev) => ({
+      ...prev,
+      selectedModel: model,
+      activeProvider: activeProviderConfig.provider,
+    }));
+    setVerifiedProviderId("");
+    setVerificationSummary("");
+  };
+
+  const parseCodingPlan = async () => {
+    if (!modelConfig.codingPlanUrl.trim() || !modelConfig.codingPlanKey.trim()) {
+      toast.error("请先填写 Coding Plan URL 和 API-Key");
+      return;
+    }
+
+    setIsParsingPlan(true);
+    try {
+      const result = await parseRemoteCodingPlan(modelConfig.codingPlanUrl, modelConfig.codingPlanKey);
+      const nextModel = result.supportedModels[0] ?? modelConfig.selectedModel ?? AI_PROVIDER_CONFIGS[0].model;
+      onModelConfigChange((prev) => ({
+        ...prev,
+        codingPlanAppId: result.appId,
+        codingPlanSummary: result.summary,
+        supportedModels: result.supportedModels,
+        selectedModel: nextModel,
+        activeProvider: inferProviderByModel(nextModel),
+      }));
+      setVerifiedProviderId("");
+      setVerificationSummary("");
+      toast.success(`已解析 Coding Plan，识别 ${result.supportedModels.length} 个支持模型`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Coding Plan 解析失败";
+      toast.error(message);
+    } finally {
+      setIsParsingPlan(false);
+    }
+  };
+
+  const saveConfig = async () => {
+    setIsSaving(true);
+    try {
+      const nextConfig = await saveRemoteModelConfig(modelConfig, { apply: false });
+      onModelConfigChange(nextConfig);
+      toast.success(`${activeProviderConfig.provider} 配置已保存`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "模型配置保存失败";
+      toast.error(message);
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const applyConfig = async () => {
+    const hasProviderKey = Boolean(modelConfig[activeProviderConfig.keyField].trim());
+    if (!hasProviderKey) {
+      toast.error(`请先填写 ${activeProviderConfig.provider} API-Key，再执行配置生效`);
+      return;
+    }
+
+    setIsApplying(true);
+    try {
+      const verification = await verifyRemoteProviderConfig(modelConfig);
+      setVerifiedProviderId(verification.providerId);
+      setVerificationSummary(verification.summary);
+      const nextConfig = await saveRemoteModelConfig(modelConfig, { apply: true });
+      onModelConfigChange(nextConfig);
+      toast.success(`已校验并生效：${verification.responseModel}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "模型配置生效失败";
+      toast.error(message);
+    } finally {
+      setIsApplying(false);
+    }
+  };
+
+  const providerKeyValue = modelConfig[activeProviderConfig.keyField];
+  const providerModels = Array.from(new Set([modelConfig.selectedModel, ...activeProviderConfig.models].filter(Boolean)));
+
+  const providerConfigPanel = (
+    <Card className="rounded-[24px] border-[#E4E7ED] bg-white shadow-[0_14px_36px_rgba(15,23,42,0.08)]">
+      <CardHeader className="space-y-3 pb-4">
+        <div className="flex flex-col gap-2 xl:flex-row xl:items-start xl:justify-between">
+          <div className="space-y-1">
+            <CardTitle className="text-[18px] text-[#0F172A]">API 模型配置</CardTitle>
+            <p className="text-sm text-[#8A94A6]">维护单个 AI 供应商的 API-Key、模型和生效状态，生效前会先完成真实校验。</p>
+          </div>
+          {verifiedProviderId === activeProviderConfig.id && verificationSummary && (
+            <div className="rounded-full bg-[#ECFDF3] px-3 py-1 text-sm text-[#15803D]">已校验</div>
+          )}
+        </div>
+
+        <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+          {AI_PROVIDER_CONFIGS.map((item) => {
+            const active = modelConfig.activeProvider === item.provider;
+            const supported = supportedProviders.has(item.provider);
+            return (
+              <button
+                key={item.provider}
+                type="button"
+                onClick={() => updateActiveProvider(item.provider)}
+                className={`rounded-[16px] border px-4 py-3 text-left transition-colors ${
+                  active
+                    ? "border-[#111827] bg-[#040815] text-white shadow-[0_8px_24px_rgba(15,23,42,0.16)]"
+                    : "border-[#E5E7EB] bg-white text-[#111827] hover:border-[#CBD5E1]"
+                }`}
+              >
+                <div className="flex items-center justify-between gap-3">
+                  <p className="text-[15px] font-medium">{item.provider}</p>
+                  {supported && <span className={`text-[11px] ${active ? "text-[#93C5FD]" : "text-[#2563EB]"}`}>Plan 支持</span>}
+                </div>
+                <p className={`mt-2 text-xs leading-5 ${active ? "text-white/70" : "text-[#64748B]"}`}>{item.protocolLabel}</p>
+              </button>
+            );
+          })}
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-6">
+        <div className="rounded-[20px] border border-[#E5E7EB] bg-[#FAFBFC] p-5">
+          <div className="grid gap-4 md:grid-cols-2">
+            <div className="space-y-2">
+              <p className="text-sm font-medium text-[#111827]">供应商标识</p>
+              <div className="rounded-[14px] border border-[#E5E7EB] bg-white px-4 py-3 text-sm text-[#334155]">
+                {activeProviderConfig.identifier}
+              </div>
+            </div>
+            <div className="space-y-2">
+              <p className="text-sm font-medium text-[#111827]">供应商名称</p>
+              <div className="rounded-[14px] border border-[#E5E7EB] bg-white px-4 py-3 text-sm text-[#334155]">
+                {activeProviderConfig.provider} / {activeProviderConfig.vendorLabel}
+              </div>
+            </div>
+            <div className="space-y-2">
+              <p className="text-sm font-medium text-[#111827]">官网链接</p>
+              <a
+                href={activeProviderConfig.officialUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="flex items-center justify-between rounded-[14px] border border-[#E5E7EB] bg-white px-4 py-3 text-sm text-[#2563EB] hover:bg-[#F8FAFC]"
+              >
+                <span className="truncate">{activeProviderConfig.officialUrl}</span>
+                <ExternalLink className="ml-3 h-4 w-4 shrink-0" />
+              </a>
+            </div>
+            <div className="space-y-2">
+              <p className="text-sm font-medium text-[#111827]">API 协议</p>
+              <div className="rounded-[14px] border border-[#E5E7EB] bg-white px-4 py-3 text-sm text-[#334155]">
+                {activeProviderConfig.protocolLabel}
+              </div>
+            </div>
+            <div className="space-y-2 md:col-span-2">
+              <p className="text-sm font-medium text-[#111827]">API 端点</p>
+              <div className="rounded-[14px] border border-[#E5E7EB] bg-white px-4 py-3 text-sm text-[#334155]">
+                {activeProviderConfig.baseUrl}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="space-y-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <p className="text-[15px] font-medium text-[#111827]">模型列表</p>
+            <Badge variant="secondary" className="rounded-full bg-[#F1F5F9] text-[#475569]">
+              默认模型
+            </Badge>
+          </div>
+          <div className="grid gap-3 md:grid-cols-2">
+            {providerModels.map((item) => {
+              const selected = modelConfig.selectedModel === item;
+              const supported = modelConfig.supportedModels.includes(item);
+              return (
+                <button
+                  key={item}
+                  type="button"
+                  onClick={() => updateSelectedModel(item)}
+                  className={`rounded-[14px] border px-4 py-3 text-left transition-colors ${
+                    selected
+                      ? "border-[#111827] bg-[#111827] text-white"
+                      : "border-[#E5E7EB] bg-white text-[#111827] hover:border-[#CBD5E1]"
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-sm font-medium">{item}</span>
+                    {supported && (
+                      <span className={`text-[11px] ${selected ? "text-[#BFDBFE]" : "text-[#2563EB]"}`}>
+                        Plan 支持
+                      </span>
+                    )}
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+          <p className="text-sm leading-6 text-[#64748B]">{activeProviderConfig.description}</p>
+        </div>
+
+        <div className="space-y-3">
+          <p className="text-[15px] font-medium text-[#111827]">{activeProviderConfig.provider} API-Key</p>
+          <div className="relative">
+            <Input
+              type={showProviderKey ? "text" : "password"}
+              value={providerKeyValue}
+              onChange={(e) => updateActiveProviderKey(e.target.value)}
+              placeholder={activeProviderConfig.placeholder}
+              className="h-14 rounded-[16px] border-[#E5E7EB] bg-[#F3F4F6] px-5 pr-14 text-[15px]"
+            />
+            <button
+              type="button"
+              className="absolute right-4 top-1/2 -translate-y-1/2 text-[#64748B]"
+              onClick={() => setShowProviderKey((prev) => !prev)}
+            >
+              {showProviderKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+            </button>
+          </div>
+        </div>
+
+        <div className="space-y-3">
+          <p className="text-[15px] font-medium text-[#111827]">配置 JSON</p>
+          <Textarea
+            readOnly
+            value={providerPreviewJson}
+            className="min-h-[220px] rounded-[18px] border-[#E5E7EB] bg-[#0F172A] font-mono text-xs leading-6 text-[#E2E8F0]"
+          />
+        </div>
+
+        <div className="rounded-[16px] border border-[#E5E7EB] bg-[#F8FAFC] px-4 py-4 text-sm leading-6 text-[#64748B]">
+          <div className="flex flex-wrap items-center gap-2">
+            <ShieldCheck className="h-4 w-4 text-[#2563EB]" />
+            <span>Coding Plan 用于识别兼容地址和支持模型；真正生效以当前 API 模型配置的标准 API-Key 为准。</span>
+          </div>
+          {verificationSummary && (
+            <p className="mt-3 rounded-[12px] bg-white px-3 py-2 text-[#15803D]">{verificationSummary}</p>
+          )}
+        </div>
+
+        <div className="flex flex-wrap justify-end gap-4 border-t border-[#E5E7EB] pt-6">
+          <Button
+            variant="outline"
+            className="h-14 min-w-[180px] rounded-[16px] border-[#D1D5DB] bg-white text-base text-[#111827] hover:bg-[#F9FAFB]"
+            onClick={saveConfig}
+            disabled={isLoading || isSaving || isApplying}
+          >
+            {isSaving ? "保存中..." : "保存配置"}
+          </Button>
+          <Button
+            className="h-14 min-w-[180px] rounded-[16px] bg-[#040815] text-base hover:bg-[#101828]"
+            onClick={applyConfig}
+            disabled={isLoading || isSaving || isApplying}
+          >
+            {isApplying ? "校验并生效中..." : "配置生效"}
+          </Button>
+        </div>
+      </CardContent>
+    </Card>
+  );
+
+  const codingPlanPanel = (
+    <Card className="rounded-[24px] border-[#E4E7ED] bg-white shadow-[0_14px_36px_rgba(15,23,42,0.08)]">
+      <CardHeader className="flex flex-row items-start justify-between space-y-0 pb-3">
+        <div className="space-y-1">
+          <CardTitle className="text-[18px] text-[#0F172A]">Coding Plan 配置</CardTitle>
+          <p className="text-sm text-[#8A94A6]">填写 URL 和 API-Key 后解析当前 Coding Plan 支持的模型。</p>
+        </div>
+        {modelConfig.supportedModels.length > 0 && (
+          <div className="inline-flex items-center gap-1 rounded-full bg-[#F3F4F6] px-3 py-1 text-sm text-[#0F172A]">
+            <CheckCircle2 className="h-4 w-4 text-[#111827]" />
+            已解析
+          </div>
+        )}
+      </CardHeader>
+      <CardContent className="space-y-6">
+        <div className="space-y-3">
+          <p className="text-[15px] font-medium text-[#111827]">Coding Plan URL</p>
+          <Input
+            value={modelConfig.codingPlanUrl}
+            onChange={(e) => onModelConfigChange((prev) => ({ ...prev, codingPlanUrl: e.target.value }))}
+            placeholder="请输入 Coding Plan URL"
+            className="h-14 rounded-[16px] border-[#E5E7EB] bg-[#F3F4F6] px-5 text-[15px]"
+          />
+        </div>
+
+        <div className="space-y-3">
+          <p className="text-[15px] font-medium text-[#111827]">API-Key</p>
+          <div className="relative">
+            <Input
+              type={showCodingPlanKey ? "text" : "password"}
+              value={modelConfig.codingPlanKey}
+              onChange={(e) => onModelConfigChange((prev) => ({ ...prev, codingPlanKey: e.target.value }))}
+              placeholder="请输入 Coding Plan API-Key"
+              className="h-14 rounded-[16px] border-[#E5E7EB] bg-[#F3F4F6] px-5 pr-14 text-[15px]"
+            />
+            <button
+              type="button"
+              className="absolute right-4 top-1/2 -translate-y-1/2 text-[#64748B]"
+              onClick={() => setShowCodingPlanKey((prev) => !prev)}
+            >
+              {showCodingPlanKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+            </button>
+          </div>
+        </div>
+
+        <Button
+          className="h-14 w-full rounded-[16px] bg-[#040815] text-base hover:bg-[#101828]"
+          onClick={parseCodingPlan}
+          disabled={isLoading || isParsingPlan}
+        >
+          {isParsingPlan ? "解析中..." : "解析 Coding Plan"}
+        </Button>
+
+        <div className="space-y-3 border-t border-[#E5E7EB] pt-6">
+          <div className="flex flex-wrap items-center gap-2">
+            <p className="text-[15px] font-medium text-[#111827]">支持的模型列表</p>
+            {modelConfig.codingPlanAppId && (
+              <Badge variant="secondary" className="rounded-full bg-[#EEF2FF] text-[#1D4ED8]">
+                {modelConfig.codingPlanAppId === "coding-plan-openai" ? "Coding Plan OpenAI 兼容地址" : modelConfig.codingPlanAppId}
+              </Badge>
+            )}
+          </div>
+          <div className="rounded-[18px] bg-[#F8FAFC] p-4">
+            {modelConfig.supportedModels.length > 0 ? (
+              <div className="grid gap-3 md:grid-cols-2">
+                {modelConfig.supportedModels.map((item) => (
+                  <button
+                    key={item}
+                    type="button"
+                    onClick={() =>
+                      onModelConfigChange((prev) => ({
+                        ...prev,
+                        selectedModel: item,
+                        activeProvider: inferProviderByModel(item),
+                      }))
+                    }
+                    className={`flex w-full items-center gap-3 rounded-[14px] border px-4 py-3 text-left transition-colors ${
+                      modelConfig.selectedModel === item
+                        ? "border-[#111827] bg-white shadow-[0_6px_20px_rgba(15,23,42,0.06)]"
+                        : "border-[#E5E7EB] bg-white hover:border-[#CBD5E1]"
+                    }`}
+                  >
+                    <CheckCircle2 className="h-5 w-5 text-[#22C55E]" />
+                    <div className="space-y-1">
+                      <p className="text-[15px] text-[#1F2937]">{item}</p>
+                      <p className="text-xs text-[#64748B]">映射供应商：{inferProviderByModel(item)}</p>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <div className="rounded-[14px] border border-dashed border-[#D1D5DB] bg-white px-4 py-6 text-sm text-[#8A94A6]">
+                解析完成后会在这里展示 Coding Plan 支持的模型，并自动高亮可映射的供应商。
+              </div>
+            )}
+          </div>
+          {modelConfig.codingPlanSummary && (
+            <div className="rounded-[16px] border border-[#E5E7EB] bg-white px-4 py-4 text-sm leading-6 text-[#64748B]">
+              {modelConfig.codingPlanSummary}
+            </div>
+          )}
+        </div>
+      </CardContent>
+    </Card>
+  );
+
+  return (
+    <div className="mx-auto w-full max-w-[1420px]">
+      <Tabs
+        value={activeConfigTab}
+        onValueChange={(value) => setActiveConfigTab(value as "provider-config" | "coding-plan")}
+        className="space-y-6"
+      >
+        <div className="rounded-[22px] border border-[#E4E7ED] bg-white px-8 py-7 shadow-[0_12px_32px_rgba(15,23,42,0.06)]">
+          <div className="flex flex-col gap-6 xl:flex-row xl:items-center xl:justify-between">
+            <div className="space-y-2">
+              <h2 className="text-2xl font-semibold text-[#111827]">模型配置</h2>
+              <p className="text-sm leading-6 text-[#8A94A6]">
+                通过顶部两个按钮在 API 模型配置和 Coding Plan 之间切换，当前页只显示一个配置面板，避免内容拥挤。
+              </p>
+              <p className="text-sm text-[#64748B]">
+                当前已生效模型：{getProviderConfig(modelConfig.appliedProvider).provider} / {modelConfig.selectedModel}
+              </p>
+            </div>
+            <TabsList className="grid h-auto grid-cols-2 rounded-[16px] bg-[#F3F4F6] p-1">
+              <TabsTrigger
+                value="provider-config"
+                className="min-w-[180px] rounded-[12px] px-5 py-3 text-sm data-[state=active]:bg-[#165DFF] data-[state=active]:text-white"
+              >
+                API 模型配置
+              </TabsTrigger>
+              <TabsTrigger
+                value="coding-plan"
+                className="min-w-[180px] rounded-[12px] px-5 py-3 text-sm data-[state=active]:bg-[#165DFF] data-[state=active]:text-white"
+              >
+                Coding Plan
+              </TabsTrigger>
+            </TabsList>
+          </div>
+        </div>
+
+        <TabsContent value="provider-config" className="mt-0">
+          {providerConfigPanel}
+        </TabsContent>
+        <TabsContent value="coding-plan" className="mt-0">
+          {codingPlanPanel}
+        </TabsContent>
+      </Tabs>
+    </div>
+  );
+}
+
+function LegacySplitModelConfigPage({
+  modelConfig,
+  onModelConfigChange,
+}: {
+  modelConfig: ModelConfig;
+  onModelConfigChange: Dispatch<SetStateAction<ModelConfig>>;
+}) {
+  const [isLoading, setIsLoading] = useState(true);
+  const [isParsingPlan, setIsParsingPlan] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+  const [isApplying, setIsApplying] = useState(false);
+  const [showCodingPlanKey, setShowCodingPlanKey] = useState(false);
+  const [showProviderKey, setShowProviderKey] = useState(false);
+  const [verificationSummary, setVerificationSummary] = useState("");
+  const [verifiedProviderId, setVerifiedProviderId] = useState("");
+  const activeProviderConfig = getProviderConfig(modelConfig.activeProvider);
+  const supportedProviders = useMemo(
+    () => new Set(modelConfig.supportedModels.map((item) => inferProviderByModel(item))),
+    [modelConfig.supportedModels],
+  );
+  const providerPreviewJson = useMemo(
+    () =>
+      buildProviderPreviewJson(
+        activeProviderConfig,
+        modelConfig[activeProviderConfig.keyField],
+        modelConfig.selectedModel || activeProviderConfig.model,
+      ),
+    [activeProviderConfig, modelConfig],
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadConfig = async () => {
+      try {
+        const remoteConfig = await loadRemoteModelConfig();
+        if (!cancelled) {
+          onModelConfigChange(remoteConfig);
+          setVerifiedProviderId("");
+          setVerificationSummary("");
+        }
+      } catch (error) {
+        if (!cancelled) {
+          const message = error instanceof Error ? error.message : "模型配置加载失败";
+          toast.error(message);
+        }
+      } finally {
+        if (!cancelled) {
+          setIsLoading(false);
+        }
+      }
+    };
+
+    loadConfig();
+    return () => {
+      cancelled = true;
+    };
+  }, [onModelConfigChange]);
+
+  const updateActiveProvider = (provider: ModelProvider) => {
+    const providerConfig = getProviderConfig(provider);
+    const supportedModel = modelConfig.supportedModels.find((item) => inferProviderByModel(item) === provider);
+    onModelConfigChange((prev) => ({
+      ...prev,
+      activeProvider: provider,
+      selectedModel: supportedModel ?? providerConfig.model,
+    }));
+    setVerifiedProviderId("");
+    setVerificationSummary("");
+    setShowCodingPlanKey(false);
+    setShowProviderKey(false);
+  };
+
+  const updateActiveProviderKey = (value: string) => {
+    onModelConfigChange((prev) => ({
+      ...prev,
+      [activeProviderConfig.keyField]: value,
+    }));
+    setVerifiedProviderId("");
+    setVerificationSummary("");
+  };
+
+  const updateSelectedModel = (model: string) => {
+    onModelConfigChange((prev) => ({
+      ...prev,
+      selectedModel: model,
+      activeProvider: activeProviderConfig.provider,
+    }));
+    setVerifiedProviderId("");
+    setVerificationSummary("");
+  };
+
+  const parseCodingPlan = async () => {
+    if (!modelConfig.codingPlanUrl.trim() || !modelConfig.codingPlanKey.trim()) {
+      toast.error("请先填写 Coding Plan URL 和 API-Key");
+      return;
+    }
+
+    setIsParsingPlan(true);
+    try {
+      const result = await parseRemoteCodingPlan(modelConfig.codingPlanUrl, modelConfig.codingPlanKey);
+      const nextModel = result.supportedModels[0] ?? modelConfig.selectedModel ?? AI_PROVIDER_CONFIGS[0].model;
+      onModelConfigChange((prev) => ({
+        ...prev,
+        codingPlanAppId: result.appId,
+        codingPlanSummary: result.summary,
+        supportedModels: result.supportedModels,
+        selectedModel: nextModel,
+        activeProvider: inferProviderByModel(nextModel),
+      }));
+      setVerifiedProviderId("");
+      setVerificationSummary("");
+      toast.success(`已解析 Coding Plan，识别 ${result.supportedModels.length} 个支持模型`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Coding Plan 解析失败";
+      toast.error(message);
+    } finally {
+      setIsParsingPlan(false);
+    }
+  };
+
+  const saveConfig = async () => {
+    setIsSaving(true);
+    try {
+      const nextConfig = await saveRemoteModelConfig(modelConfig, { apply: false });
+      onModelConfigChange(nextConfig);
+      toast.success(`${activeProviderConfig.provider} 配置已保存`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "模型配置保存失败";
+      toast.error(message);
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const applyConfig = async () => {
+    const hasProviderKey = Boolean(modelConfig[activeProviderConfig.keyField].trim());
+    if (!hasProviderKey) {
+      toast.error(`请先填写 ${activeProviderConfig.provider} API-Key，再执行配置生效`);
+      return;
+    }
+
+    setIsApplying(true);
+    try {
+      const verification = await verifyRemoteProviderConfig(modelConfig);
+      setVerifiedProviderId(verification.providerId);
+      setVerificationSummary(verification.summary);
+      const nextConfig = await saveRemoteModelConfig(modelConfig, { apply: true });
+      onModelConfigChange(nextConfig);
+      toast.success(`已校验并生效：${verification.responseModel}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "模型配置生效失败";
+      toast.error(message);
+    } finally {
+      setIsApplying(false);
+    }
+  };
+
+  const providerKeyValue = modelConfig[activeProviderConfig.keyField];
+  const providerModels = Array.from(new Set([modelConfig.selectedModel, ...activeProviderConfig.models].filter(Boolean)));
+
+  return (
+    <div className="mx-auto w-full max-w-[1420px] space-y-6">
+      <div className="rounded-[22px] border border-[#E4E7ED] bg-white px-8 py-7 shadow-[0_12px_32px_rgba(15,23,42,0.06)]">
+        <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
+          <div className="space-y-2">
+            <h2 className="text-2xl font-semibold text-[#111827]">模型配置</h2>
+            <p className="text-sm leading-6 text-[#8A94A6]">
+              左侧用于解析 Coding Plan 支持的模型，右侧用于维护真实供应商 API-Key，并在生效前完成一次真实调用校验。
+            </p>
+            <p className="text-sm text-[#64748B]">
+              当前已生效：{getProviderConfig(modelConfig.appliedProvider).provider} / {modelConfig.selectedModel}
+            </p>
+          </div>
+          <div className="rounded-[16px] border border-[#E5E7EB] bg-[#F8FAFC] px-4 py-3 text-sm text-[#475569]">
+            配置生效时会先校验当前供应商，再把该供应商同步到标书解析、提纲生成和章节生成。
+          </div>
+        </div>
+      </div>
+
+      <div className="grid gap-6 xl:grid-cols-[0.88fr_1.12fr]">
+        <Card className="rounded-[24px] border-[#E4E7ED] bg-white shadow-[0_14px_36px_rgba(15,23,42,0.08)]">
+          <CardHeader className="flex flex-row items-start justify-between space-y-0 pb-3">
+            <div className="space-y-1">
+              <CardTitle className="text-[18px] text-[#0F172A]">Coding Plan 配置</CardTitle>
+              <p className="text-sm text-[#8A94A6]">填写 URL 和 API-Key 后解析当前 Coding Plan 支持的模型。</p>
+            </div>
+            {modelConfig.supportedModels.length > 0 && (
+              <div className="inline-flex items-center gap-1 rounded-full bg-[#F3F4F6] px-3 py-1 text-sm text-[#0F172A]">
+                <CheckCircle2 className="h-4 w-4 text-[#111827]" />
+                已解析
+              </div>
+            )}
+          </CardHeader>
+          <CardContent className="space-y-6">
+            <div className="space-y-3">
+              <p className="text-[15px] font-medium text-[#111827]">Coding Plan URL</p>
+              <Input
+                value={modelConfig.codingPlanUrl}
+                onChange={(e) => onModelConfigChange((prev) => ({ ...prev, codingPlanUrl: e.target.value }))}
+                placeholder="请输入 Coding Plan URL"
+                className="h-14 rounded-[16px] border-[#E5E7EB] bg-[#F3F4F6] px-5 text-[15px]"
+              />
+            </div>
+
+            <div className="space-y-3">
+              <p className="text-[15px] font-medium text-[#111827]">API-Key</p>
+              <div className="relative">
+                <Input
+                  type={showCodingPlanKey ? "text" : "password"}
+                  value={modelConfig.codingPlanKey}
+                  onChange={(e) => onModelConfigChange((prev) => ({ ...prev, codingPlanKey: e.target.value }))}
+                  placeholder="请输入 Coding Plan API-Key"
+                  className="h-14 rounded-[16px] border-[#E5E7EB] bg-[#F3F4F6] px-5 pr-14 text-[15px]"
+                />
+                <button
+                  type="button"
+                  className="absolute right-4 top-1/2 -translate-y-1/2 text-[#64748B]"
+                  onClick={() => setShowCodingPlanKey((prev) => !prev)}
+                >
+                  {showCodingPlanKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                </button>
+              </div>
+            </div>
+
+            <Button
+              className="h-14 w-full rounded-[16px] bg-[#040815] text-base hover:bg-[#101828]"
+              onClick={parseCodingPlan}
+              disabled={isLoading || isParsingPlan}
+            >
+              {isParsingPlan ? "解析中..." : "解析 Coding Plan"}
+            </Button>
+
+            <div className="space-y-3 border-t border-[#E5E7EB] pt-6">
+              <div className="flex flex-wrap items-center gap-2">
+                <p className="text-[15px] font-medium text-[#111827]">支持的模型列表</p>
+                {modelConfig.codingPlanAppId && (
+                  <Badge variant="secondary" className="rounded-full bg-[#EEF2FF] text-[#1D4ED8]">
+                    {modelConfig.codingPlanAppId === "coding-plan-openai" ? "Coding Plan OpenAI 兼容地址" : modelConfig.codingPlanAppId}
+                  </Badge>
+                )}
+              </div>
+              <div className="rounded-[18px] bg-[#F8FAFC] p-4">
+                {modelConfig.supportedModels.length > 0 ? (
+                  <div className="grid gap-3 md:grid-cols-2">
+                    {modelConfig.supportedModels.map((item) => (
+                      <button
+                        key={item}
+                        type="button"
+                        onClick={() =>
+                          onModelConfigChange((prev) => ({
+                            ...prev,
+                            selectedModel: item,
+                            activeProvider: inferProviderByModel(item),
+                          }))
+                        }
+                        className={`flex w-full items-center gap-3 rounded-[14px] border px-4 py-3 text-left transition-colors ${
+                          modelConfig.selectedModel === item
+                            ? "border-[#111827] bg-white shadow-[0_6px_20px_rgba(15,23,42,0.06)]"
+                            : "border-[#E5E7EB] bg-white hover:border-[#CBD5E1]"
+                        }`}
+                      >
+                        <CheckCircle2 className="h-5 w-5 text-[#22C55E]" />
+                        <div className="space-y-1">
+                          <p className="text-[15px] text-[#1F2937]">{item}</p>
+                          <p className="text-xs text-[#64748B]">映射供应商：{inferProviderByModel(item)}</p>
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="rounded-[14px] border border-dashed border-[#D1D5DB] bg-white px-4 py-6 text-sm text-[#8A94A6]">
+                    解析完成后会在这里展示 Coding Plan 支持的模型，并自动高亮可映射的供应商。
+                  </div>
+                )}
+              </div>
+              {modelConfig.codingPlanSummary && (
+                <div className="rounded-[16px] border border-[#E5E7EB] bg-white px-4 py-4 text-sm leading-6 text-[#64748B]">
+                  {modelConfig.codingPlanSummary}
+                </div>
+              )}
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="rounded-[24px] border-[#E4E7ED] bg-white shadow-[0_14px_36px_rgba(15,23,42,0.08)]">
+          <CardHeader className="space-y-3 pb-4">
+            <div className="flex flex-col gap-2 xl:flex-row xl:items-start xl:justify-between">
+              <div className="space-y-1">
+                <CardTitle className="text-[18px] text-[#0F172A]">AI 供应商配置</CardTitle>
+                <p className="text-sm text-[#8A94A6]">参考 CC Switch 的供应商配置方式，当前只编辑一个供应商，保存后可再生效。</p>
+              </div>
+              {verifiedProviderId === activeProviderConfig.id && verificationSummary && (
+                <div className="rounded-full bg-[#ECFDF3] px-3 py-1 text-sm text-[#15803D]">
+                  已校验
+                </div>
+              )}
+            </div>
+
+            <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+              {AI_PROVIDER_CONFIGS.map((item) => {
+                const active = modelConfig.activeProvider === item.provider;
+                const supported = supportedProviders.has(item.provider);
+                return (
+                  <button
+                    key={item.provider}
+                    type="button"
+                    onClick={() => updateActiveProvider(item.provider)}
+                    className={`rounded-[16px] border px-4 py-3 text-left transition-colors ${
+                      active
+                        ? "border-[#111827] bg-[#040815] text-white shadow-[0_8px_24px_rgba(15,23,42,0.16)]"
+                        : "border-[#E5E7EB] bg-white text-[#111827] hover:border-[#CBD5E1]"
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-3">
+                      <p className="text-[15px] font-medium">{item.provider}</p>
+                      {supported && <span className={`text-[11px] ${active ? "text-[#93C5FD]" : "text-[#2563EB]"}`}>Plan 支持</span>}
+                    </div>
+                    <p className={`mt-2 text-xs leading-5 ${active ? "text-white/70" : "text-[#64748B]"}`}>{item.protocolLabel}</p>
+                  </button>
+                );
+              })}
+            </div>
+          </CardHeader>
+          <CardContent className="space-y-6">
+            <div className="rounded-[20px] border border-[#E5E7EB] bg-[#FAFBFC] p-5">
+              <div className="grid gap-4 md:grid-cols-2">
+                <div className="space-y-2">
+                  <p className="text-sm font-medium text-[#111827]">供应商标识</p>
+                  <div className="rounded-[14px] border border-[#E5E7EB] bg-white px-4 py-3 text-sm text-[#334155]">
+                    {activeProviderConfig.identifier}
+                  </div>
+                </div>
+                <div className="space-y-2">
+                  <p className="text-sm font-medium text-[#111827]">供应商名称</p>
+                  <div className="rounded-[14px] border border-[#E5E7EB] bg-white px-4 py-3 text-sm text-[#334155]">
+                    {activeProviderConfig.provider} / {activeProviderConfig.vendorLabel}
+                  </div>
+                </div>
+                <div className="space-y-2">
+                  <p className="text-sm font-medium text-[#111827]">官网链接</p>
+                  <a
+                    href={activeProviderConfig.officialUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="flex items-center justify-between rounded-[14px] border border-[#E5E7EB] bg-white px-4 py-3 text-sm text-[#2563EB] hover:bg-[#F8FAFC]"
+                  >
+                    <span className="truncate">{activeProviderConfig.officialUrl}</span>
+                    <ExternalLink className="ml-3 h-4 w-4 shrink-0" />
+                  </a>
+                </div>
+                <div className="space-y-2">
+                  <p className="text-sm font-medium text-[#111827]">API 协议</p>
+                  <div className="rounded-[14px] border border-[#E5E7EB] bg-white px-4 py-3 text-sm text-[#334155]">
+                    {activeProviderConfig.protocolLabel}
+                  </div>
+                </div>
+                <div className="space-y-2 md:col-span-2">
+                  <p className="text-sm font-medium text-[#111827]">API 端点</p>
+                  <div className="rounded-[14px] border border-[#E5E7EB] bg-white px-4 py-3 text-sm text-[#334155]">
+                    {activeProviderConfig.baseUrl}
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div className="space-y-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <p className="text-[15px] font-medium text-[#111827]">模型列表</p>
+                <Badge variant="secondary" className="rounded-full bg-[#F1F5F9] text-[#475569]">
+                  默认模型
+                </Badge>
+              </div>
+              <div className="grid gap-3 md:grid-cols-2">
+                {providerModels.map((item) => {
+                  const selected = modelConfig.selectedModel === item;
+                  const supported = modelConfig.supportedModels.includes(item);
+                  return (
+                    <button
+                      key={item}
+                      type="button"
+                      onClick={() => updateSelectedModel(item)}
+                      className={`rounded-[14px] border px-4 py-3 text-left transition-colors ${
+                        selected
+                          ? "border-[#111827] bg-[#111827] text-white"
+                          : "border-[#E5E7EB] bg-white text-[#111827] hover:border-[#CBD5E1]"
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-3">
+                        <span className="text-sm font-medium">{item}</span>
+                        {supported && (
+                          <span className={`text-[11px] ${selected ? "text-[#BFDBFE]" : "text-[#2563EB]"}`}>
+                            Plan 支持
+                          </span>
+                        )}
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+              <p className="text-sm leading-6 text-[#64748B]">{activeProviderConfig.description}</p>
+            </div>
+
+            <div className="space-y-3">
+              <p className="text-[15px] font-medium text-[#111827]">{activeProviderConfig.provider} API-Key</p>
+              <div className="relative">
+                <Input
+                  type={showProviderKey ? "text" : "password"}
+                  value={providerKeyValue}
+                  onChange={(e) => updateActiveProviderKey(e.target.value)}
+                  placeholder={activeProviderConfig.placeholder}
+                  className="h-14 rounded-[16px] border-[#E5E7EB] bg-[#F3F4F6] px-5 pr-14 text-[15px]"
+                />
+                <button
+                  type="button"
+                  className="absolute right-4 top-1/2 -translate-y-1/2 text-[#64748B]"
+                  onClick={() => setShowProviderKey((prev) => !prev)}
+                >
+                  {showProviderKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                </button>
+              </div>
+            </div>
+
+            <div className="space-y-3">
+              <p className="text-[15px] font-medium text-[#111827]">配置 JSON</p>
+              <Textarea
+                readOnly
+                value={providerPreviewJson}
+                className="min-h-[220px] rounded-[18px] border-[#E5E7EB] bg-[#0F172A] font-mono text-xs leading-6 text-[#E2E8F0]"
+              />
+            </div>
+
+            <div className="rounded-[16px] border border-[#E5E7EB] bg-[#F8FAFC] px-4 py-4 text-sm leading-6 text-[#64748B]">
+              <div className="flex flex-wrap items-center gap-2">
+                <ShieldCheck className="h-4 w-4 text-[#2563EB]" />
+                <span>左侧 Coding Plan 只负责识别兼容地址和支持模型；真正生效以右侧当前供应商的标准 API-Key 为准。</span>
+              </div>
+              {verificationSummary && (
+                <p className="mt-3 rounded-[12px] bg-white px-3 py-2 text-[#15803D]">{verificationSummary}</p>
+              )}
+            </div>
+
+            <div className="flex flex-wrap justify-end gap-4 border-t border-[#E5E7EB] pt-6">
+              <Button
+                variant="outline"
+                className="h-14 min-w-[180px] rounded-[16px] border-[#D1D5DB] bg-white text-base text-[#111827] hover:bg-[#F9FAFB]"
+                onClick={saveConfig}
+                disabled={isLoading || isSaving || isApplying}
+              >
+                {isSaving ? "保存中..." : "保存配置"}
+              </Button>
+              <Button
+                className="h-14 min-w-[180px] rounded-[16px] bg-[#040815] text-base hover:bg-[#101828]"
+                onClick={applyConfig}
+                disabled={isLoading || isSaving || isApplying}
+              >
+                {isApplying ? "校验并生效中..." : "配置生效"}
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+    </div>
+  );
+}
+
+function LegacyModelConfigPage({
+  modelConfig,
+  onModelConfigChange,
+}: {
+  modelConfig: ModelConfig;
+  onModelConfigChange: Dispatch<SetStateAction<ModelConfig>>;
+}) {
+  const [isLoading, setIsLoading] = useState(true);
+  const [isParsingPlan, setIsParsingPlan] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+  const [isApplying, setIsApplying] = useState(false);
+  const activeProviderConfig = getProviderConfig(modelConfig.activeProvider);
+  const supportedProviders = new Set(modelConfig.supportedModels.map((item) => inferProviderByModel(item)));
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadConfig = async () => {
+      try {
+        const remoteConfig = await loadRemoteModelConfig();
+        if (!cancelled) {
+          onModelConfigChange(remoteConfig);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          const message = error instanceof Error ? error.message : "模型配置加载失败";
+          toast.error(message);
+        }
+      } finally {
+        if (!cancelled) {
+          setIsLoading(false);
+        }
+      }
+    };
+
+    loadConfig();
+    return () => {
+      cancelled = true;
+    };
+  }, [onModelConfigChange]);
+
+  const updateActiveProvider = (provider: ModelProvider) => {
+    const providerConfig = getProviderConfig(provider);
+    const supportedModel = modelConfig.supportedModels.find((item) => inferProviderByModel(item) === provider);
+    onModelConfigChange((prev) => ({
+      ...prev,
+      activeProvider: provider,
+      selectedModel: supportedModel ?? providerConfig.model,
+    }));
+  };
+
+  const updateActiveProviderKey = (value: string) => {
+    onModelConfigChange((prev) => ({
+      ...prev,
+      [activeProviderConfig.keyField]: value,
+    }));
+  };
+
+  const parseCodingPlan = async () => {
+    if (!modelConfig.codingPlanUrl.trim() || !modelConfig.codingPlanKey.trim()) {
+      toast.error("请先填写 Coding Plan URL 和 API-Key");
+      return;
+    }
+
+    setIsParsingPlan(true);
+    try {
+      const result = await parseRemoteCodingPlan(modelConfig.codingPlanUrl, modelConfig.codingPlanKey);
+      const nextModel = result.supportedModels[0] ?? modelConfig.selectedModel ?? AI_PROVIDER_CONFIGS[0].model;
+      onModelConfigChange((prev) => ({
+        ...prev,
+        codingPlanAppId: result.appId,
+        codingPlanSummary: result.summary,
+        supportedModels: result.supportedModels,
+        selectedModel: nextModel,
+        activeProvider: inferProviderByModel(nextModel),
+      }));
+      toast.success(`已解析 Coding Plan，识别 ${result.supportedModels.length} 个支持模型`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Coding Plan 解析失败";
+      toast.error(message);
+    } finally {
+      setIsParsingPlan(false);
+    }
+  };
+
+  const saveConfig = async () => {
+    setIsSaving(true);
+    try {
+      const nextConfig = await saveRemoteModelConfig(modelConfig, { apply: false });
+      onModelConfigChange(nextConfig);
+      toast.success(`${activeProviderConfig.provider} 配置已保存`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "模型配置保存失败";
+      toast.error(message);
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const applyConfig = async () => {
+    const hasProviderKey = Boolean(modelConfig[activeProviderConfig.keyField].trim());
+
+    if (!hasProviderKey) {
+      toast.error("请先在右侧为当前 AI 模型填写标准 API-Key，再执行配置生效");
+      return;
+    }
+
+    setIsApplying(true);
+    try {
+      const nextConfig = await saveRemoteModelConfig(modelConfig, { apply: true });
+      onModelConfigChange(nextConfig);
+      toast.success(`配置已生效：${nextConfig.selectedModel}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "模型配置生效失败";
+      toast.error(message);
+    } finally {
+      setIsApplying(false);
+    }
+  };
+
+  return (
+    <div className="mx-auto w-full max-w-[1380px] space-y-6">
+      <div className="rounded-[18px] border border-[#E4E7ED] bg-white px-8 py-7 shadow-[0_12px_32px_rgba(15,23,42,0.06)]">
+        <h2 className="text-2xl font-semibold text-[#111827]">模型配置</h2>
+        <p className="mt-2 text-sm text-[#8A94A6]">左侧解析 Coding Plan，右侧维护单个 AI 的 API-Key 并手动生效。</p>
+        <p className="mt-2 text-sm text-[#8A94A6]">
+          当前已生效模型：{getProviderConfig(modelConfig.appliedProvider).provider} / {modelConfig.selectedModel}
+        </p>
+      </div>
+
+      <div className="grid gap-6 xl:grid-cols-[0.9fr_1.1fr]">
+        <Card className="rounded-[24px] border-[#E4E7ED] bg-white shadow-[0_14px_36px_rgba(15,23,42,0.08)]">
+          <CardHeader className="flex flex-row items-start justify-between space-y-0 pb-3">
+            <div className="space-y-1">
+              <CardTitle className="text-[18px] text-[#0F172A]">Coding Plan 配置</CardTitle>
+              <p className="text-sm text-[#8A94A6]">输入 URL 和 API-Key 后解析当前 Coding Plan 支持的模型。</p>
+            </div>
+            {modelConfig.supportedModels.length > 0 && (
+              <div className="inline-flex items-center gap-1 rounded-full bg-[#F3F4F6] px-3 py-1 text-sm text-[#0F172A]">
+                <CheckCircle2 className="h-4 w-4 text-[#111827]" />
+                已解析
+              </div>
+            )}
+          </CardHeader>
+          <CardContent className="space-y-6">
+            <div className="space-y-3">
+              <p className="text-[15px] font-medium text-[#111827]">Coding Plan URL</p>
+              <Input
+                value={modelConfig.codingPlanUrl}
+                onChange={(e) => onModelConfigChange((prev) => ({ ...prev, codingPlanUrl: e.target.value }))}
+                placeholder="请输入 Coding Plan URL"
+                className="h-14 rounded-[16px] border-[#E5E7EB] bg-[#F3F4F6] px-5 text-[15px]"
+              />
+            </div>
+            <div className="space-y-3">
+              <p className="text-[15px] font-medium text-[#111827]">API-Key</p>
+              <Input
+                type="password"
+                value={modelConfig.codingPlanKey}
+                onChange={(e) => onModelConfigChange((prev) => ({ ...prev, codingPlanKey: e.target.value }))}
+                placeholder="请输入 Coding Plan API-Key"
+                className="h-14 rounded-[16px] border-[#E5E7EB] bg-[#F3F4F6] px-5 text-[15px]"
+              />
+            </div>
+            <Button
+              className="h-14 w-full rounded-[16px] bg-[#040815] text-base hover:bg-[#101828]"
+              onClick={parseCodingPlan}
+              disabled={isLoading || isParsingPlan}
+            >
+              {isParsingPlan ? "解析中..." : "解析 Coding Plan"}
+            </Button>
+
+            <div className="border-t border-[#E5E7EB] pt-6">
+              <p className="text-[15px] font-medium text-[#111827]">支持的模型列表</p>
+              <div className="mt-4 rounded-[18px] bg-[#F8FAFC] p-4">
+                {modelConfig.supportedModels.length > 0 ? (
+                  <div className="space-y-3">
+                    {modelConfig.supportedModels.map((item) => (
+                      <button
+                        key={item}
+                        type="button"
+                        onClick={() =>
+                          onModelConfigChange((prev) => ({
+                            ...prev,
+                            selectedModel: item,
+                            activeProvider: inferProviderByModel(item),
+                          }))
+                        }
+                        className={`flex w-full items-center gap-3 rounded-[14px] border px-4 py-3 text-left transition-colors ${
+                          modelConfig.selectedModel === item
+                            ? "border-[#111827] bg-white shadow-[0_6px_20px_rgba(15,23,42,0.06)]"
+                            : "border-[#E5E7EB] bg-white hover:border-[#CBD5E1]"
+                        }`}
+                      >
+                        <CheckCircle2 className="h-5 w-5 text-[#22C55E]" />
+                        <span className="text-[15px] text-[#1F2937]">{item}</span>
+                      </button>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="rounded-[14px] border border-dashed border-[#D1D5DB] bg-white px-4 py-6 text-sm text-[#8A94A6]">
+                    解析完成后会在这里显示 Coding Plan 支持的模型。
+                  </div>
+                )}
+              </div>
+              {modelConfig.codingPlanAppId && (
+                <p className="mt-3 text-xs text-[#8A94A6]">
+                  {modelConfig.codingPlanAppId === "coding-plan-openai"
+                    ? "连接类型：Coding Plan OpenAI 兼容地址"
+                    : `应用 ID：${modelConfig.codingPlanAppId}`}
+                </p>
+              )}
+              {modelConfig.codingPlanSummary && (
+                <p className="mt-2 text-xs leading-6 text-[#8A94A6]">{modelConfig.codingPlanSummary}</p>
+              )}
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="rounded-[24px] border-[#E4E7ED] bg-white shadow-[0_14px_36px_rgba(15,23,42,0.08)]">
+          <CardHeader className="space-y-1 pb-4">
+            <CardTitle className="text-[18px] text-[#0F172A]">AI 模型配置</CardTitle>
+            <p className="text-sm text-[#8A94A6]">每次只维护一个 AI 的 API-Key，保存后再手动生效。</p>
+          </CardHeader>
+          <CardContent className="space-y-6">
+            <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+              {AI_PROVIDER_CONFIGS.map((item) => {
+                const active = modelConfig.activeProvider === item.provider;
+                const supported = supportedProviders.has(item.provider);
+                return (
+                  <button
+                    key={item.provider}
+                    type="button"
+                    onClick={() => updateActiveProvider(item.provider)}
+                    className={`rounded-[16px] border px-4 py-3 text-left transition-colors ${
+                      active
+                        ? "border-[#111827] bg-[#040815] text-white shadow-[0_8px_24px_rgba(15,23,42,0.16)]"
+                        : "border-[#E5E7EB] bg-white text-[#111827] hover:border-[#CBD5E1]"
+                    }`}
+                  >
+                    <p className="text-[15px] font-medium">{item.provider}</p>
+                    <p className={`mt-2 text-xs ${active ? "text-white/70" : supported ? "text-[#2563EB]" : "text-[#9CA3AF]"}`}>
+                      {supported ? "当前 Coding Plan 支持" : "可单独配置"}
+                    </p>
+                  </button>
+                );
+              })}
+            </div>
+
+            <div className="space-y-3">
+              <p className="text-[15px] font-medium text-[#111827]">当前模型</p>
+              <div className="rounded-[16px] border border-[#E5E7EB] bg-[#F3F4F6] px-5 py-4 text-[15px] text-[#111827]">
+                {modelConfig.selectedModel}
+              </div>
+            </div>
+
+            <div className="space-y-3">
+              <p className="text-[15px] font-medium text-[#111827]">{activeProviderConfig.provider} API-Key</p>
+              <Input
+                type="password"
+                value={modelConfig[activeProviderConfig.keyField]}
+                onChange={(e) => updateActiveProviderKey(e.target.value)}
+                placeholder={activeProviderConfig.placeholder}
+                className="h-14 rounded-[16px] border-[#E5E7EB] bg-[#F3F4F6] px-5 text-[15px]"
+              />
+            </div>
+
+            <div className="flex items-center gap-2 rounded-[14px] bg-[#F8FAFC] px-4 py-3 text-sm text-[#64748B]">
+              <CheckCircle2 className="h-4 w-4 text-[#22C55E]" />
+              左侧 Coding Plan 仅用于识别兼容地址和支持模型；真正生效仍以右侧标准模型 API-Key 为准。
+            </div>
+
+            <div className="flex flex-wrap justify-end gap-4 border-t border-[#E5E7EB] pt-6">
+              <Button
+                variant="outline"
+                className="h-14 min-w-[180px] rounded-[16px] border-[#D1D5DB] bg-white text-base text-[#111827] hover:bg-[#F9FAFB]"
+                onClick={saveConfig}
+                disabled={isLoading || isSaving || isApplying}
+              >
+                {isSaving ? "保存中..." : "保存配置"}
+              </Button>
+              <Button
+                className="h-14 min-w-[180px] rounded-[16px] bg-[#040815] text-base hover:bg-[#101828]"
+                onClick={applyConfig}
+                disabled={isLoading || isSaving || isApplying}
+              >
+                {isApplying ? "生效中..." : "配置生效"}
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
       </div>
     </div>
   );
@@ -1252,6 +2618,8 @@ function AssetPage({
   const overallUploadInputRef = useRef<HTMLInputElement | null>(null);
   const solutionUploadInputRef = useRef<HTMLInputElement | null>(null);
   const resumeUploadInputRef = useRef<HTMLInputElement | null>(null);
+
+  return <EnterpriseLibraryPage activeCategory={activeCategory} onCategoryChange={onCategoryChange} />;
 
   const categories: { key: AssetCategory; label: string }[] = [
     { key: "qualification", label: "企业资质" },
@@ -2275,109 +3643,58 @@ function TenderClausePanel() {
 }
 
 function TenderPage({
+  projectName,
+  remoteProjectId,
   uploadedTender,
-  onUploadTender,
-  parseProgress,
-  isParsing,
-  onParse,
+  initialCategories,
   onGoCompliance,
   onNextStep,
   onAnalysisComplete,
 }: {
+  projectName: string;
+  remoteProjectId?: string | null;
   uploadedTender: { name: string; size: string; format: string } | null;
-  onUploadTender: (v: { name: string; size: string; format: string }) => void;
-  parseProgress: number;
-  isParsing: boolean;
-  onParse: () => void;
+  initialCategories: TenderParsedCategory[];
   onGoCompliance: () => void;
   onNextStep: () => void;
-  onAnalysisComplete: (requirements: TenderRequirement[]) => void;
+  onAnalysisComplete: (payload: TenderAnalysisCompletePayload) => void;
 }) {
+  const [analysisUi, setAnalysisUi] = useState({
+    isAnalyzing: false,
+    isReady: initialCategories.length > 0,
+    progress: initialCategories.length > 0 ? 100 : 0,
+    stage: "",
+  });
+
   return (
     <div className="space-y-4">
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-base">智能读标结果</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="mb-4">
-            <TenderAnalyzer onAnalysisComplete={onAnalysisComplete} />
-          </div>
-          <Tabs defaultValue="basic" className="w-full">
-            <TabsList className="inline-flex h-9 w-full flex-wrap justify-start gap-1 rounded-[8px] bg-[#F0F2F5] p-1">
-              <TabsTrigger value="basic" className="rounded-[8px] data-[state=active]:bg-[#165DFF] data-[state=active]:text-white">
-                <span className="mr-1.5">基础信息</span>
-                <CheckCircle2 className="h-3.5 w-3.5 text-green-600" />
-              </TabsTrigger>
-              <TabsTrigger value="qualify" className="rounded-[8px] data-[state=active]:bg-[#165DFF] data-[state=active]:text-white">
-                <span className="mr-1.5">资格要求</span>
-                <CheckCircle2 className="h-3.5 w-3.5 text-green-600" />
-              </TabsTrigger>
-              <TabsTrigger value="review" className="rounded-[8px] data-[state=active]:bg-[#165DFF] data-[state=active]:text-white">
-                <span className="mr-1.5">评审要求</span>
-                <CheckCircle2 className="h-3.5 w-3.5 text-green-600" />
-              </TabsTrigger>
-              <TabsTrigger value="bidDoc" className="rounded-[8px] data-[state=active]:bg-[#165DFF] data-[state=active]:text-white">
-                <span className="mr-1.5">投标文件要求</span>
-                <CheckCircle2 className="h-3.5 w-3.5 text-green-600" />
-              </TabsTrigger>
-              <TabsTrigger value="invalid" className="rounded-[8px] data-[state=active]:bg-[#165DFF] data-[state=active]:text-white">
-                <span className="mr-1.5">无效标与废标项</span>
-                <CheckCircle2 className="h-3.5 w-3.5 text-green-600" />
-              </TabsTrigger>
-              <TabsTrigger value="submit" className="rounded-[8px] data-[state=active]:bg-[#165DFF] data-[state=active]:text-white">
-                <span className="mr-1.5">应标需提交文件</span>
-                <CheckCircle2 className="h-3.5 w-3.5 text-green-600" />
-              </TabsTrigger>
-              <TabsTrigger value="clause" className="rounded-[8px] data-[state=active]:bg-[#165DFF] data-[state=active]:text-white">
-                <span className="mr-1.5">招标文件审查</span>
-                <CheckCircle2 className="h-3.5 w-3.5 text-green-600" />
-              </TabsTrigger>
-            </TabsList>
-
-            {/* 基础信息：左半边结构化信息 + 右半边招标原文 */}
-            <TabsContent value="basic" className="mt-4">
-              <TenderBasicInfoPanel />
-            </TabsContent>
-            <TabsContent value="qualify" className="mt-4">
-              <TenderQualifyPanel />
-            </TabsContent>
-            <TabsContent value="review" className="mt-4">
-              <TenderReviewPanel />
-            </TabsContent>
-            <TabsContent value="bidDoc" className="mt-4">
-              <TenderBidDocPanel />
-            </TabsContent>
-            <TabsContent value="invalid" className="mt-4">
-              <TenderInvalidPanel />
-            </TabsContent>
-            <TabsContent value="submit" className="mt-4">
-              <TenderSubmitPanel />
-            </TabsContent>
-            <TabsContent value="clause" className="mt-4">
-              <TenderClausePanel />
-            </TabsContent>
-          </Tabs>
-          <div className="mt-4 flex items-center justify-between border-t border-[#E4E7ED] pt-4">
-            <Button variant="outline" className="rounded-[8px]" onClick={() => toast.success("已导出解析报告（示意）")}>
-              导出解析报告
-            </Button>
-            <Button className="rounded-[8px] bg-[#165DFF] hover:bg-[#0F42C1]" onClick={onNextStep}>
-              下一步
-            </Button>
-          </div>
-        </CardContent>
-      </Card>
-
-      <Card className="border-red-300">
-        <CardContent className="flex items-center justify-between py-4">
+      <ConnectedTenderPage
+        projectName={projectName}
+        remoteProjectId={remoteProjectId}
+        initialUploadedTender={uploadedTender}
+        initialCategories={initialCategories}
+        onAnalysisComplete={onAnalysisComplete}
+        onAnalysisUiChange={setAnalysisUi}
+      />
+      <Card className="border-[#E4E7ED]">
+        <CardContent className="flex flex-wrap items-center justify-between gap-3 py-4">
           <div>
-            <p className="font-semibold text-red-700">风险预警：存在 2 项废标风险</p>
-            <p className="text-xs text-slate-600">偏离项：资质有效期、盖章页完整性</p>
+            <p className="font-semibold text-[#303133]">解析完成后可进入修改建议与标书编制</p>
+            <p className="text-xs text-[#909399]">
+              {analysisUi.isReady
+                ? "当前七大类结果会同步到项目上下文和章节导航。"
+                : analysisUi.isAnalyzing
+                  ? `正在解析中：${analysisUi.progress}%${analysisUi.stage ? ` / ${analysisUi.stage}` : ""}`
+                  : "全部解析完成前，按钮保持灰色不可点击。"}
+            </p>
           </div>
           <div className="flex gap-2">
-            <Button variant="outline" onClick={() => toast.success("对标检查已开始（示意）")}>对标检查</Button>
-            <Button onClick={onGoCompliance}>查看修改建议</Button>
+            <Button variant="outline" onClick={onGoCompliance} disabled={!analysisUi.isReady}>
+              查看修改建议
+            </Button>
+            <Button className="bg-[#165DFF] hover:bg-[#0F42C1]" onClick={onNextStep} disabled={!analysisUi.isReady}>
+              下一步
+            </Button>
           </div>
         </CardContent>
       </Card>
@@ -3346,42 +4663,259 @@ function CollaborationPage({ role, projectContext }: { role: Role; projectContex
   );
 }
 
-function CompliancePage() {
+function severityOrder(severity: ComplianceSuggestionSeverity) {
+  if (severity === "high") return 3;
+  if (severity === "medium") return 2;
+  return 1;
+}
+
+function severityBadgeClassName(severity: ComplianceSuggestionSeverity) {
+  if (severity === "high") {
+    return "border-red-200 bg-red-50 text-red-700";
+  }
+  if (severity === "medium") {
+    return "border-amber-200 bg-amber-50 text-amber-700";
+  }
+  return "border-slate-200 bg-slate-50 text-slate-700";
+}
+
+function severityLabel(severity: ComplianceSuggestionSeverity) {
+  if (severity === "high") return "高风险";
+  if (severity === "medium") return "中风险";
+  return "低风险";
+}
+
+function complianceTabLabel(key: ComplianceSuggestionSectionKey) {
+  if (key === "check") return "智能审查";
+  if (key === "score") return "对标评分";
+  return "合规库查询";
+}
+
+function emptyComplianceSection(key: ComplianceSuggestionSectionKey): ComplianceSuggestionSection {
+  return {
+    key,
+    title: complianceTabLabel(key),
+    summary: "当前尚未生成有效建议，请先完成标书解析后重新进入本页。",
+    items: [],
+  };
+}
+
+function CompliancePage({
+  projectContext,
+  onGoProposal,
+}: {
+  projectContext: ProjectContext;
+  onGoProposal: () => void;
+}) {
+  const [activeTab, setActiveTab] = useState<ComplianceSuggestionSectionKey>("check");
+  const [state, setState] = useState<
+    | { status: "idle" }
+    | { status: "loading" }
+    | { status: "error"; message: string }
+    | { status: "ready"; data: ComplianceRecommendationResult }
+  >({ status: "idle" });
+
+  const canLoadRecommendations = Boolean(
+    projectContext.lastParsedAt &&
+      projectContext.activeProjectId &&
+      projectContext.activeProjectId !== "proj-default",
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+
+    if (!canLoadRecommendations) {
+      setState({ status: "idle" });
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    setState({ status: "loading" });
+    void (async () => {
+      try {
+        const data = await fetchComplianceRecommendations(
+          projectContext.activeProjectId,
+          `${projectContext.activeProjectId}:${projectContext.lastParsedAt ?? ""}`,
+        );
+        if (!cancelled) {
+          setState({ status: "ready", data });
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setState({
+            status: "error",
+            message: error instanceof Error ? error.message : "修改建议生成失败",
+          });
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [canLoadRecommendations, projectContext.activeProjectId, projectContext.lastParsedAt]);
+
+  const recommendation = state.status === "ready" ? state.data : null;
+  const sectionMap = useMemo(() => {
+    return new Map((recommendation?.sections ?? []).map((section) => [section.key, section]));
+  }, [recommendation]);
+
+  const reportItems = useMemo(() => {
+    if (!recommendation) {
+      return [];
+    }
+
+    return recommendation.sections
+      .flatMap((section) =>
+        section.items.map((item) => ({
+          ...item,
+          sectionTitle: section.title,
+        })),
+      )
+      .sort((left, right) => severityOrder(right.severity) - severityOrder(left.severity))
+      .slice(0, 4);
+  }, [recommendation]);
+
+  const generatedAtText = recommendation
+    ? new Date(recommendation.generatedAt).toLocaleString("zh-CN", { hour12: false })
+    : "";
+
   return (
     <div className="space-y-4">
       <Card>
         <CardHeader>
+          <div className="flex flex-row-reverse flex-wrap items-center justify-between gap-3">
+            <Button
+              className="bg-[#165DFF] hover:bg-[#0F42C1]"
+              onClick={onGoProposal}
+              disabled={!canLoadRecommendations}
+            >
+              进入标书编制
+            </Button>
           <CardTitle className="text-base">合规与质量控制</CardTitle>
+          </div>
         </CardHeader>
         <CardContent>
-          <Tabs defaultValue="check">
-            <TabsList className="grid w-full grid-cols-3">
-              <TabsTrigger value="check">智能审查</TabsTrigger>
-              <TabsTrigger value="score">对标评分</TabsTrigger>
-              <TabsTrigger value="library">合规库查询</TabsTrigger>
-            </TabsList>
-            <TabsContent value="check" className="mt-3 rounded border p-3 text-sm">
-              上传标书后自动检查格式、签字、盖章、附件完整性，并给出修改建议。
-            </TabsContent>
-            <TabsContent value="score" className="mt-3 rounded border p-3 text-sm">
-              选择评分细则后自动模拟评标，输出得分和薄弱项。
-            </TabsContent>
-            <TabsContent value="library" className="mt-3 rounded border p-3 text-sm">
-              可检索法规、行业标准、废标条款库，并显示更新时间。
-            </TabsContent>
-          </Tabs>
+          {!canLoadRecommendations && (
+            <div className="rounded border border-dashed border-[#D0D7E2] bg-[#FAFAFA] px-4 py-10 text-center text-sm text-[#909399]">
+              完成标书解析后，这里会自动生成三类 AI 修改建议，并关联解析证据。
+            </div>
+          )}
+
+          {state.status === "loading" && (
+            <div className="flex min-h-[240px] items-center justify-center gap-2 rounded border bg-slate-50 text-sm text-slate-600">
+              <Clock3 className="h-4 w-4 animate-spin" />
+              正在生成真实修改建议，请稍候。
+            </div>
+          )}
+
+          {state.status === "error" && (
+            <div className="rounded border border-red-200 bg-red-50 px-4 py-6 text-sm text-red-700">
+              {state.message}
+            </div>
+          )}
+
+          {recommendation && (
+            <Tabs value={activeTab} onValueChange={(value) => setActiveTab(value as ComplianceSuggestionSectionKey)}>
+              <TabsList className="grid w-full grid-cols-3">
+                <TabsTrigger value="check">智能审查</TabsTrigger>
+                <TabsTrigger value="score">对标评分</TabsTrigger>
+                <TabsTrigger value="library">合规库查询</TabsTrigger>
+              </TabsList>
+
+              {(["check", "score", "library"] as const).map((key) => {
+                const section = sectionMap.get(key) ?? emptyComplianceSection(key);
+                return (
+                  <TabsContent key={key} value={key} className="mt-3 space-y-3">
+                    <div className="rounded border bg-slate-50 p-3 text-sm text-slate-700">
+                      <p className="font-medium text-[#303133]">{section.title}</p>
+                      <p className="mt-1 leading-6">{section.summary}</p>
+                    </div>
+
+                    {section.items.length === 0 ? (
+                      <div className="rounded border border-dashed border-[#D0D7E2] bg-white px-4 py-8 text-center text-sm text-[#909399]">
+                        当前没有可展示的修改项。
+                      </div>
+                    ) : (
+                      <div className="space-y-3">
+                        {section.items.map((item, index) => (
+                          <div key={`${section.key}-${index}-${item.title}`} className="rounded border bg-white p-4">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <p className="font-medium text-[#303133]">{item.title}</p>
+                              <Badge variant="outline" className={severityBadgeClassName(item.severity)}>
+                                {severityLabel(item.severity)}
+                              </Badge>
+                            </div>
+                            <div className="mt-3 space-y-2 text-sm leading-6 text-slate-700">
+                              <p>
+                                <span className="font-medium text-[#303133]">问题：</span>
+                                {item.problem}
+                              </p>
+                              <p>
+                                <span className="font-medium text-[#303133]">建议：</span>
+                                {item.suggestion}
+                              </p>
+                              {item.evidence && (
+                                <p className="text-xs text-slate-500">
+                                  <span className="font-medium text-slate-600">依据：</span>
+                                  {item.evidence}
+                                </p>
+                              )}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </TabsContent>
+                );
+              })}
+            </Tabs>
+          )}
         </CardContent>
       </Card>
-      <Card className="border-red-200">
+
+      <Card className={recommendation?.highRiskCount ? "border-red-200" : "border-[#E4E7ED]"}>
         <CardHeader>
           <CardTitle className="text-sm">审查报告</CardTitle>
         </CardHeader>
-        <CardContent className="space-y-2 text-sm">
-          <div className="flex items-center gap-2 text-red-700">
-            <AlertTriangle className="h-4 w-4" />
-            发现问题 4 项（高风险 2 项）
-          </div>
-          <p className="text-xs text-slate-600">资质有效期缺失证明；附件目录与正文引用不一致；盖章页分辨率不足。</p>
+        <CardContent className="space-y-3 text-sm">
+          {!recommendation && (
+            <p className="text-xs text-slate-600">完成解析后，这里会汇总 AI 生成的风险统计与优先处理项。</p>
+          )}
+
+          {recommendation && (
+            <>
+              <div className="flex flex-wrap items-center gap-3">
+                <div className="flex items-center gap-2 text-red-700">
+                  <AlertTriangle className="h-4 w-4" />
+                  发现问题 {recommendation.riskCount} 项（高风险 {recommendation.highRiskCount} 项）
+                </div>
+                <Badge variant="outline" className="border-[#D0D7E2] bg-[#F5F7FA] text-[#606266]">
+                  生成时间 {generatedAtText}
+                </Badge>
+              </div>
+
+              <p className="text-xs leading-6 text-slate-600">{recommendation.summary}</p>
+
+              {reportItems.length > 0 && (
+                <div className="space-y-2">
+                  {reportItems.map((item, index) => (
+                    <div key={`${item.sectionTitle}-${index}-${item.title}`} className="rounded border bg-slate-50 p-3">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <p className="font-medium text-[#303133]">{item.title}</p>
+                        <Badge variant="outline" className={severityBadgeClassName(item.severity)}>
+                          {severityLabel(item.severity)}
+                        </Badge>
+                        <span className="text-xs text-slate-500">{item.sectionTitle}</span>
+                      </div>
+                      <p className="mt-2 text-sm leading-6 text-slate-700">{item.problem}</p>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </>
+          )}
         </CardContent>
       </Card>
     </div>

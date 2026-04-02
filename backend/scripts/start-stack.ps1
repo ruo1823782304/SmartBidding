@@ -10,6 +10,8 @@ $backendRoot = Split-Path -Parent $PSScriptRoot
 $runRoot = Join-Path $backendRoot ".run"
 $pidRoot = Join-Path $runRoot "pids"
 $logRoot = Join-Path $runRoot "logs"
+$powershellExe = (Get-Command powershell.exe).Source
+$backendSupervisorScript = Join-Path $PSScriptRoot "backend-supervisor.ps1"
 $minioRoot = Join-Path $backendRoot "tools\\minio"
 $minioExe = Join-Path $minioRoot "minio.exe"
 $minioData = Join-Path $backendRoot "local-storage\\minio-data"
@@ -61,6 +63,58 @@ function Wait-Port {
   }
 
   throw "Port $Port did not become ready in time."
+}
+
+function Get-PidFromFile {
+  param([string]$Path)
+
+  if (-not (Test-Path $Path)) {
+    return $null
+  }
+
+  $raw = Get-Content -LiteralPath $Path -ErrorAction SilentlyContinue | Select-Object -First 1
+  if (-not $raw) {
+    return $null
+  }
+
+  $parsed = 0
+  if ([int]::TryParse($raw, [ref]$parsed)) {
+    return $parsed
+  }
+
+  return $null
+}
+
+function Stop-BackendSupervisorIfStale {
+  $supervisorPidFile = Join-Path $pidRoot "backend-supervisor.pid"
+  $backendPidFile = Join-Path $pidRoot "backend.pid"
+  $stopFile = Join-Path $pidRoot "backend.stop"
+  $supervisorPid = Get-PidFromFile -Path $supervisorPidFile
+
+  if (-not $supervisorPid) {
+    Remove-Item -LiteralPath $supervisorPidFile -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $backendPidFile -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $stopFile -Force -ErrorAction SilentlyContinue
+    return
+  }
+
+  $supervisor = Get-Process -Id $supervisorPid -ErrorAction SilentlyContinue
+  if (-not $supervisor) {
+    Remove-Item -LiteralPath $supervisorPidFile -Force -ErrorAction SilentlyContinue
+    return
+  }
+
+  New-Item -ItemType File -Path $stopFile -Force | Out-Null
+
+  $backendPid = Get-PidFromFile -Path $backendPidFile
+  if ($backendPid) {
+    Stop-Process -Id $backendPid -Force -ErrorAction SilentlyContinue
+  }
+
+  Stop-Process -Id $supervisorPid -Force -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath $supervisorPidFile -Force -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath $backendPidFile -Force -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath $stopFile -Force -ErrorAction SilentlyContinue
 }
 
 function Start-LocalMinio {
@@ -119,17 +173,30 @@ function Start-BackendRuntime {
     return
   }
 
-  $stdout = Join-Path $logRoot "backend.out.log"
-  $stderr = Join-Path $logRoot "backend.err.log"
-  $env:PORT = "3001"
-  $process = Start-Process -FilePath $nodeExe `
-    -ArgumentList "dist\\src\\main.js" `
+  Stop-BackendSupervisorIfStale
+
+  $supervisorPidFile = Join-Path $pidRoot "backend-supervisor.pid"
+  $supervisorOut = Join-Path $logRoot "backend.supervisor.out.log"
+  $supervisorErr = Join-Path $logRoot "backend.supervisor.err.log"
+  $stopFile = Join-Path $pidRoot "backend.stop"
+  Remove-Item -LiteralPath $stopFile -Force -ErrorAction SilentlyContinue
+  $process = Start-Process -FilePath $powershellExe `
+    -ArgumentList @(
+      "-NoProfile",
+      "-ExecutionPolicy", "Bypass",
+      "-File", $backendSupervisorScript,
+      "-BackendRoot", $backendRoot,
+      "-NodeExe", ('"{0}"' -f $nodeExe),
+      "-PidRoot", $pidRoot,
+      "-LogRoot", $logRoot,
+      "-Port", "3001"
+    ) `
     -WorkingDirectory $backendRoot `
-    -RedirectStandardOutput $stdout `
-    -RedirectStandardError $stderr `
+    -RedirectStandardOutput $supervisorOut `
+    -RedirectStandardError $supervisorErr `
     -PassThru
 
-  Set-Content -Path (Join-Path $pidRoot "backend.pid") -Value $process.Id
+  Set-Content -Path $supervisorPidFile -Value $process.Id
   Wait-Port -Port 3001
 }
 

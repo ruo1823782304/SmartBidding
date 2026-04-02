@@ -1,4 +1,5 @@
-import { Body, Controller, Get, Param, Post, Put, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Param, Post, Put, Query, Res, StreamableFile, UseGuards } from '@nestjs/common';
+import type { Response } from 'express';
 import { ProposalService } from './proposal.service';
 import { SectionContentDto } from './dto/section-content.dto';
 import { SectionCompleteDto } from './dto/section-complete.dto';
@@ -9,6 +10,11 @@ import { CurrentUser, JwtPayload } from '../common/decorators/current-user.decor
 @UseGuards(JwtAuthGuard)
 export class ProposalController {
   constructor(private readonly proposalService: ProposalService) {}
+
+  @Get(':projectId/sections')
+  async listSections(@Param('projectId') projectId: string) {
+    return this.proposalService.listSections(projectId);
+  }
 
   @Get(':projectId/sections/:sectionKey/content')
   async getSectionContent(
@@ -46,8 +52,14 @@ export class ProposalController {
   async getRecommendations(
     @Param('projectId') projectId: string,
     @Param('sectionKey') sectionKey: string,
+    @Query('title') title?: string,
   ) {
-    return this.proposalService.getRecommendations(projectId, decodeURIComponent(sectionKey));
+    return this.proposalService.getRecommendations(projectId, decodeURIComponent(sectionKey), title);
+  }
+
+  @Get(':projectId/compliance/recommendations')
+  async getComplianceRecommendations(@Param('projectId') projectId: string) {
+    return this.proposalService.getComplianceRecommendations(projectId);
   }
 
   @Post(':projectId/proposal/submit')
@@ -62,28 +74,57 @@ export class ProposalController {
   async export(
     @Param('projectId') projectId: string,
     @Query('format') format: 'word' | 'pdf' = 'word',
+    @Query('kind') kind: 'tech' | 'biz' = 'tech',
   ) {
-    return this.proposalService.exportDoc(projectId, format);
+    return this.proposalService.exportDoc(projectId, format, kind);
   }
 
   @Post(':projectId/proposal/export')
   async exportPost(
     @Param('projectId') projectId: string,
-    @Body() body: { format?: 'word' | 'pdf' },
+    @Body() body: { format?: 'word' | 'pdf'; kind?: 'tech' | 'biz' },
   ) {
-    return this.proposalService.exportDoc(projectId, body?.format || 'word');
+    return this.proposalService.exportDoc(projectId, body?.format || 'word', body?.kind || 'tech');
+  }
+
+  @Get(':projectId/proposal/export/file')
+  async exportFile(
+    @Param('projectId') projectId: string,
+    @Query('format') format: 'word' | 'pdf' = 'word',
+    @Query('kind') kind: 'tech' | 'biz' = 'tech',
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    const file = await this.proposalService.exportDocFile(projectId, format, kind);
+    response.setHeader('Content-Type', file.mimeType);
+    response.setHeader(
+      'Content-Disposition',
+      `attachment; filename*=UTF-8''${encodeURIComponent(file.fileName)}`,
+    );
+    return new StreamableFile(file.buffer);
   }
 
   @Post(':projectId/sections/:sectionKey/generate')
   async generateSection(
     @Param('projectId') projectId: string,
     @Param('sectionKey') sectionKey: string,
-    @Body() body: { context?: string },
+    @Body()
+    body: {
+      context?: string;
+      currentContent?: string;
+      sectionTitle?: string;
+      sectionDetail?: string;
+      outlinePath?: string;
+      bidKind?: 'tech' | 'biz';
+      assetIds?: string[];
+      sourceItemIds?: string[];
+      boundRequirementText?: string;
+      customPrompt?: string;
+    },
   ) {
     const content = await this.proposalService.generateSectionContent(
       projectId,
       decodeURIComponent(sectionKey),
-      body?.context,
+      body,
     );
     return { content };
   }

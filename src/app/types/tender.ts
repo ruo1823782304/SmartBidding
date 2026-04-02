@@ -13,6 +13,18 @@ export type TenderSourceTrace = {
   location: string;
   quote: string;
   paragraph: string;
+  pageNo?: number | null;
+  documentVersionId?: string | null;
+  sourceItemId?: string;
+  blocks?: TenderSourceTraceBlock[];
+};
+
+export type TenderSourceTraceBlock = {
+  blockId: string;
+  pageNo?: number | null;
+  paragraphNo?: number | null;
+  sectionPath?: string | null;
+  quote?: string | null;
 };
 
 export type TenderParsedItem = {
@@ -34,6 +46,23 @@ export type TenderParsedCategory = {
   groups: TenderParsedGroup[];
 };
 
+export type TenderCategoryAnalysisStatus = "pending" | "running" | "completed" | "failed";
+
+export type TenderCategoryProgress = {
+  key: string;
+  label: string;
+  status: TenderCategoryAnalysisStatus;
+  itemCount: number;
+};
+
+export type TenderAnalysisProgressPayload = {
+  progress: number;
+  stage: string;
+  summary: string;
+  categories: TenderParsedCategory[];
+  categoryProgress: TenderCategoryProgress[];
+};
+
 export type TenderAnalysisCompletePayload = {
   remoteProjectId: string;
   remoteFileId: string;
@@ -41,6 +70,7 @@ export type TenderAnalysisCompletePayload = {
   uploadedTender: { name: string; size: string; format: string };
   requirements: TenderRequirement[];
   categories: TenderParsedCategory[];
+  categoryProgress: TenderCategoryProgress[];
   outline: string;
   summary: string;
   parsedAt: string;

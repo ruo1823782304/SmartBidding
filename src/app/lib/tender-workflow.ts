@@ -1,16 +1,17 @@
 import type {
   TenderAnalysisCompletePayload,
+  TenderAnalysisProgressPayload,
+  TenderCategoryProgress,
   TenderParsedCategory,
   TenderParsedGroup,
   TenderParsedItem,
   TenderRequirement,
   TenderSourceTrace,
 } from "../types/tender";
+import { getBackendToken, getBackendUsername, requestBlob, requestJson } from "./backend-api";
+const TENDER_PARSE_POLL_INTERVAL_MS = 1200;
 
-const API_BASE = (import.meta.env.VITE_TENDER_BACKEND_BASE_URL ?? "http://127.0.0.1:3001/api").replace(/\/+$/, "");
-const BACKEND_USERNAME = import.meta.env.VITE_TENDER_BACKEND_USERNAME ?? "admin";
-const BACKEND_PASSWORD = import.meta.env.VITE_TENDER_BACKEND_PASSWORD ?? "admin123";
-const TOKEN_STORAGE_KEY = "smart-bidding.backend-token";
+export const TENDER_TRACE_PENDING_LOCATION = "原文定位待加载";
 
 type BackendParseItem = {
   id: string;
@@ -30,6 +31,7 @@ type BackendParseCategory = {
 };
 
 type BackendParseTraceBlock = {
+  blockId: string;
   pageNo: number | null;
   sectionPath?: string | null;
   paragraphNo?: number | null;
@@ -43,9 +45,31 @@ type BackendParseTraceChunk = {
   text?: string | null;
 };
 
+type BackendCategoryProgress = {
+  key: string;
+  label: string;
+  status: TenderCategoryProgress["status"];
+  itemCount: number;
+};
+
 type BackendTraceResponse = {
+  item?: BackendParseItem;
   trace?: BackendParseTraceBlock[];
   chunks?: BackendParseTraceChunk[];
+  parseResult?: {
+    documentVersionId?: string;
+  };
+};
+
+type BackendParseResultResponse = {
+  status: string;
+  progress: number;
+  stage: string;
+  categoryProgress?: BackendCategoryProgress[];
+  result?: {
+    summary?: string;
+    majorItems?: BackendParseCategory[];
+  };
 };
 
 const MAJOR_CODE_TO_KEY: Record<string, string> = {
@@ -86,22 +110,36 @@ function getLastPathSegment(value?: string | null) {
     .at(-1) ?? "";
 }
 
+function buildPageLabel(start?: number | null, end?: number | null) {
+  if (start == null && end == null) {
+    return "";
+  }
+  if (start != null && end != null) {
+    return start === end ? `第 ${start} 页` : `第 ${start}-${end} 页`;
+  }
+  const page = start ?? end;
+  return page != null ? `第 ${page} 页` : "";
+}
+
 function buildLocation(blocks: BackendParseTraceBlock[], chunks: BackendParseTraceChunk[]) {
   const firstBlock = blocks[0];
-  if (firstBlock?.pageNo != null) {
-    const paragraph = firstBlock.paragraphNo != null ? ` / 第 ${firstBlock.paragraphNo} 段` : "";
-    return `第 ${firstBlock.pageNo} 页${paragraph}`;
+  const lastBlock = blocks.at(-1);
+  const pageLabel = buildPageLabel(firstBlock?.pageNo, lastBlock?.pageNo);
+  const paragraphLabel = firstBlock?.paragraphNo != null ? `第 ${firstBlock.paragraphNo} 段` : "";
+  const sectionLabel = getLastPathSegment(firstBlock?.sectionPath ?? chunks[0]?.sectionPath);
+
+  const composed = [pageLabel, paragraphLabel, sectionLabel].filter(Boolean).join(" / ");
+  if (composed) {
+    return composed;
   }
 
   const firstChunk = chunks[0];
-  if (firstChunk?.pageStart != null && firstChunk?.pageEnd != null) {
-    if (firstChunk.pageStart === firstChunk.pageEnd) {
-      return `第 ${firstChunk.pageStart} 页`;
-    }
-    return `第 ${firstChunk.pageStart}-${firstChunk.pageEnd} 页`;
+  const chunkPageLabel = buildPageLabel(firstChunk?.pageStart, firstChunk?.pageEnd);
+  if (chunkPageLabel) {
+    return sectionLabel ? `${chunkPageLabel} / ${sectionLabel}` : chunkPageLabel;
   }
 
-  return "原文定位待补充";
+  return sectionLabel ? `章节：${sectionLabel}` : "原文定位待补充";
 }
 
 function buildTrace(item: BackendParseItem, traceResponse: BackendTraceResponse): TenderSourceTrace {
@@ -122,55 +160,43 @@ function buildTrace(item: BackendParseItem, traceResponse: BackendTraceResponse)
     firstChunk?.text ||
     blocks.map((entry) => entry.quote).filter(Boolean).join("\n") ||
     quote;
+  const hasConcreteSource = blocks.length > 0 || chunks.length > 0;
+  const unresolved = item.content === "未找到" && !hasConcreteSource;
 
   return {
     id: `${item.id}-trace`,
     outline,
-    location: buildLocation(blocks, chunks),
-    quote,
-    paragraph,
+    location: unresolved ? "未找到原文依据" : buildLocation(blocks, chunks),
+    quote: unresolved ? "未找到" : quote,
+    paragraph: unresolved ? "未找到" : paragraph,
+    pageNo: firstBlock?.pageNo ?? firstChunk?.pageStart ?? null,
+    documentVersionId: traceResponse.parseResult?.documentVersionId ?? null,
+    sourceItemId: item.id,
+    blocks: blocks.map((block) => ({
+      blockId: block.blockId,
+      pageNo: block.pageNo,
+      paragraphNo: block.paragraphNo,
+      sectionPath: block.sectionPath,
+      quote: block.quote,
+    })),
   };
 }
 
-async function requestJson<T>(path: string, init?: RequestInit, token?: string): Promise<T> {
-  const headers = new Headers(init?.headers);
-  if (!headers.has("Content-Type") && init?.body && !(init.body instanceof FormData)) {
-    headers.set("Content-Type", "application/json");
-  }
-  if (token) {
-    headers.set("Authorization", `Bearer ${token}`);
-  }
-
-  const response = await fetch(`${API_BASE}${path}`, {
-    ...init,
-    headers,
-  });
-
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(text || `Request failed: ${response.status}`);
-  }
-
-  return response.json() as Promise<T>;
+function buildPendingTrace(item: BackendParseItem): TenderSourceTrace {
+  return {
+    id: `${item.id}-trace`,
+    outline: item.normalizedValue?.sectionPath || item.title,
+    location: TENDER_TRACE_PENDING_LOCATION,
+    quote: item.sourceQuote || item.content,
+    paragraph: item.sourceQuote || item.content,
+    pageNo: null,
+    documentVersionId: null,
+    sourceItemId: item.id,
+    blocks: [],
+  };
 }
 
-async function getBackendToken() {
-  const cached = sessionStorage.getItem(TOKEN_STORAGE_KEY);
-  if (cached) {
-    return cached;
-  }
-
-  const result = await requestJson<{ token: string }>("/auth/login", {
-    method: "POST",
-    body: JSON.stringify({
-      username: BACKEND_USERNAME,
-      password: BACKEND_PASSWORD,
-    }),
-  });
-
-  sessionStorage.setItem(TOKEN_STORAGE_KEY, result.token);
-  return result.token;
-}
+const tenderTraceCache = new Map<string, TenderSourceTrace>();
 
 async function ensureRemoteProject(projectName: string, remoteProjectId?: string | null) {
   if (remoteProjectId) {
@@ -184,7 +210,7 @@ async function ensureRemoteProject(projectName: string, remoteProjectId?: string
       method: "POST",
       body: JSON.stringify({
         name: projectName,
-        owner: BACKEND_USERNAME,
+        owner: getBackendUsername(),
         type: "智能标书库",
       }),
     },
@@ -217,21 +243,46 @@ async function startTenderParse(remoteProjectId: string, remoteFileId: string) {
   }, token);
 }
 
-async function pollTenderParse(taskId: string, onProgress?: (progress: number, stage: string) => void) {
+async function pollTenderParse(
+  taskId: string,
+  onProgress?: (payload: TenderAnalysisProgressPayload) => void,
+) {
   const token = await getBackendToken();
-  for (let attempt = 0; attempt < 60; attempt += 1) {
-    const result = await requestJson<{ status: string; progress: number; stage: string }>(
+  let cachedCategories: TenderParsedCategory[] = [];
+  let cachedSummary = "";
+  let lastSnapshotKey = "";
+
+  for (let attempt = 0; attempt < 180; attempt += 1) {
+    const result = await requestJson<BackendParseResultResponse>(
       `/tender/parse/status/${taskId}`,
       undefined,
       token,
     );
 
-    onProgress?.(result.progress ?? 0, result.stage ?? "");
+    const snapshotKey =
+      result.result?.majorItems
+        ?.map((category) => `${category.majorCode}:${category.items.map((item) => item.id).join(",")}`)
+        .join("|") ?? "";
+
+    if (result.result?.majorItems && snapshotKey !== lastSnapshotKey) {
+      cachedCategories = hydrateCategories(result.result.majorItems);
+      cachedSummary = result.result.summary ?? "";
+      lastSnapshotKey = snapshotKey;
+    }
+
+    onProgress?.({
+      progress: result.progress ?? 0,
+      stage: result.stage ?? "",
+      summary: result.result?.summary ?? cachedSummary,
+      categories: cachedCategories,
+      categoryProgress: result.categoryProgress ?? [],
+    });
+
     if (result.status === "succeeded" || result.status === "failed") {
       return result;
     }
 
-    await new Promise((resolve) => window.setTimeout(resolve, 2000));
+    await new Promise((resolve) => window.setTimeout(resolve, TENDER_PARSE_POLL_INTERVAL_MS));
   }
 
   throw new Error("解析轮询超时，请稍后重试。");
@@ -239,7 +290,7 @@ async function pollTenderParse(taskId: string, onProgress?: (progress: number, s
 
 async function fetchTenderParseResult(taskId: string) {
   const token = await getBackendToken();
-  return requestJson<{ result?: { summary?: string; majorItems?: BackendParseCategory[] } }>(
+  return requestJson<BackendParseResultResponse>(
     `/tender/parse/result?taskId=${encodeURIComponent(taskId)}`,
     undefined,
     token,
@@ -255,45 +306,72 @@ async function fetchTrace(itemId: string) {
   );
 }
 
-async function hydrateCategories(majorItems: BackendParseCategory[]) {
-  const categories = await Promise.all(
-    majorItems.map(async (category): Promise<TenderParsedCategory> => {
-      const groupMap = new Map<string, TenderParsedGroup>();
+export async function fetchTenderItemTrace(itemId: string) {
+  const cachedTrace = tenderTraceCache.get(itemId);
+  if (cachedTrace) {
+    return cachedTrace;
+  }
 
-      const parsedItems = await Promise.all(
-        category.items.map(async (item): Promise<TenderParsedItem> => {
-          const traceResponse = await fetchTrace(item.id);
-          return {
-            id: item.id,
-            title: item.title,
-            content: item.content,
-            trace: buildTrace(item, traceResponse),
-          };
-        }),
-      );
+  const traceResponse = await fetchTrace(itemId);
+  const trace = traceResponse.item ? buildTrace(traceResponse.item, traceResponse) : {
+    id: `${itemId}-trace`,
+    outline: itemId,
+    location: "页码待定位",
+    quote: "",
+    paragraph: "",
+    pageNo: null,
+    documentVersionId: traceResponse.parseResult?.documentVersionId ?? null,
+    sourceItemId: itemId,
+    blocks: [],
+  };
+  tenderTraceCache.set(itemId, trace);
+  return trace;
+}
 
-      parsedItems.forEach((item, index) => {
-        const groupLabel = getLastPathSegment(item.trace.outline) || `解析结果 ${index + 1}`;
-        const groupKey = sanitizeKey(groupLabel || `${category.majorCode}-${index + 1}`);
-        const currentGroup = groupMap.get(groupKey);
-        if (currentGroup) {
-          currentGroup.items.push(item);
-          return;
-        }
-        groupMap.set(groupKey, {
-          key: groupKey,
-          label: groupLabel,
-          items: [item],
-        });
-      });
-
-      return {
-        key: MAJOR_CODE_TO_KEY[category.majorCode] ?? category.majorCode,
-        label: category.majorName,
-        groups: Array.from(groupMap.values()),
-      };
-    }),
+export async function fetchTenderSourceDocument(documentVersionId: string) {
+  const token = await getBackendToken();
+  return requestBlob(
+    `/tender/documents/${encodeURIComponent(documentVersionId)}/source-file`,
+    undefined,
+    token,
   );
+}
+
+function hydrateCategories(majorItems: BackendParseCategory[]) {
+  const categories = majorItems.map((category): TenderParsedCategory => {
+    const groupMap = new Map<string, TenderParsedGroup>();
+
+    const parsedItems = category.items.map((item): TenderParsedItem => {
+      const resolvedTrace = tenderTraceCache.get(item.id) ?? buildPendingTrace(item);
+      return {
+        id: item.id,
+        title: item.title,
+        content: item.content,
+        trace: resolvedTrace,
+      };
+    });
+
+    parsedItems.forEach((item, index) => {
+      const groupLabel = getLastPathSegment(item.trace.outline) || `解析结果 ${index + 1}`;
+      const groupKey = sanitizeKey(groupLabel || `${category.majorCode}-${index + 1}`);
+      const currentGroup = groupMap.get(groupKey);
+      if (currentGroup) {
+        currentGroup.items.push(item);
+        return;
+      }
+      groupMap.set(groupKey, {
+        key: groupKey,
+        label: groupLabel,
+        items: [item],
+      });
+    });
+
+    return {
+      key: MAJOR_CODE_TO_KEY[category.majorCode] ?? category.majorCode,
+      label: category.majorName,
+      groups: Array.from(groupMap.values()),
+    };
+  });
 
   const orderedKeys = ["basic", "qualify", "review", "bidDoc", "invalid", "submit", "clause", "other"];
   return categories.sort(
@@ -325,7 +403,7 @@ export async function runTenderAnalysisWorkflow({
   projectName: string;
   remoteProjectId?: string | null;
   file: File;
-  onProgress?: (progress: number, stage: string) => void;
+  onProgress?: (payload: TenderAnalysisProgressPayload) => void;
 }): Promise<TenderAnalysisCompletePayload> {
   const ensuredRemoteProjectId = await ensureRemoteProject(projectName, remoteProjectId);
   const upload = await uploadTenderFile(ensuredRemoteProjectId, file);
@@ -337,7 +415,7 @@ export async function runTenderAnalysisWorkflow({
   }
 
   const parseResult = await fetchTenderParseResult(parse.taskId);
-  const categories = await hydrateCategories(parseResult.result?.majorItems ?? []);
+  const categories = hydrateCategories(parseResult.result?.majorItems ?? []);
   const requirements = buildRequirements(categories);
   const parsedAt = new Date().toISOString();
 
@@ -352,6 +430,7 @@ export async function runTenderAnalysisWorkflow({
     },
     requirements,
     categories,
+    categoryProgress: status.categoryProgress ?? [],
     outline: buildDraftOutline(requirements),
     summary: parseResult.result?.summary ?? "",
     parsedAt,

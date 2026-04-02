@@ -70,8 +70,43 @@ export class TenderParseWorker implements OnModuleInit, OnModuleDestroy {
         chunks: chunkDrafts,
       });
 
-      await this.documentService.updateParseJobProgress(parseJob.id, ParseJobStage.LLM_EXTRACT, 85);
-      const parseResultDraft = this.ragService.buildParseResult(persisted.chunks);
+      await this.documentService.updateParseJobProgress(parseJob.id, ParseJobStage.LLM_EXTRACT, 60);
+      const parseResultDraft = await this.ragService.buildParseResult(persisted.chunks, {
+        onCategoryComplete: async (snapshot) => {
+          await this.documentService.replaceParseResult({
+            parseJobId: parseJob.id,
+            projectId: parseJob.projectId ?? undefined,
+            documentId: parseJob.documentId,
+            documentVersionId: parseJob.documentVersionId,
+            summary: snapshot.summary,
+            status: 'running',
+            modelProvider: snapshot.modelProvider,
+            modelName: snapshot.modelName,
+            promptVersion: snapshot.promptVersion,
+            schemaVersion: snapshot.schemaVersion,
+            items: snapshot.items.map((item) => ({
+              majorCode: item.majorCode as MajorParseCode,
+              minorCode: item.minorCode,
+              title: item.title,
+              content: item.content,
+              normalizedValue: item.normalizedValue as Prisma.InputJsonValue | undefined,
+              confidence: item.confidence,
+              priority: item.priority,
+              isRequired: item.isRequired,
+              riskLevel: item.riskLevel as RiskLevel,
+              sourceParagraphIds: item.sourceParagraphIds,
+              sourceChunkIds: item.sourceChunkIds,
+              sourceQuote: item.sourceQuote,
+            })),
+          });
+
+          await this.documentService.updateParseJobProgress(
+            parseJob.id,
+            ParseJobStage.LLM_EXTRACT,
+            this.calculateLlmProgress(snapshot.completedCategories, snapshot.totalCategories),
+          );
+        },
+      });
 
       await this.documentService.replaceParseResult({
         parseJobId: parseJob.id,
@@ -79,6 +114,10 @@ export class TenderParseWorker implements OnModuleInit, OnModuleDestroy {
         documentId: parseJob.documentId,
         documentVersionId: parseJob.documentVersionId,
         summary: parseResultDraft.summary,
+        modelProvider: parseResultDraft.modelProvider,
+        modelName: parseResultDraft.modelName,
+        promptVersion: parseResultDraft.promptVersion,
+        schemaVersion: parseResultDraft.schemaVersion,
         items: parseResultDraft.items.map((item) => ({
           majorCode: item.majorCode as MajorParseCode,
           minorCode: item.minorCode,
@@ -102,5 +141,14 @@ export class TenderParseWorker implements OnModuleInit, OnModuleDestroy {
       await this.documentService.markParseJobFailed(job.data.parseJobId, message);
       throw error;
     }
+  }
+
+  private calculateLlmProgress(completedCategories: number, totalCategories: number) {
+    if (totalCategories <= 0) {
+      return 60;
+    }
+
+    const ratio = Math.min(1, Math.max(0, completedCategories / totalCategories));
+    return Math.min(96, 60 + Math.round(ratio * 36));
   }
 }

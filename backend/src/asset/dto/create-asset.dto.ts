@@ -16,4 +16,16 @@ export class CreateAssetDto {
   @IsArray()
   @IsString({ each: true })
   tags?: string[];
+
+  @IsOptional()
+  @IsString()
+  subtype?: string;
+
+  @IsOptional()
+  @IsString()
+  sourceMode?: string;
+
+  @IsOptional()
+  @IsString()
+  metadata?: string;
 }

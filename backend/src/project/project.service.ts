@@ -3,6 +3,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { CreateProjectDto } from './dto/create-project.dto';
 import { UpdateStatusDto } from './dto/update-status.dto';
 import { OutlineDto } from './dto/outline.dto';
+import { normalizeOutlineGroups } from '../proposal/proposal-outline.util';
 
 @Injectable()
 export class ProjectService {
@@ -83,18 +84,23 @@ export class ProjectService {
     if (!project) throw new NotFoundException('项目不存在');
     return {
       tenderOutline: project.tenderOutline ?? undefined,
-      techOutlineSections: project.techOutlineSections as unknown as OutlineDto['techOutlineSections'],
-      bizOutlineSections: project.bizOutlineSections as unknown as OutlineDto['bizOutlineSections'],
+      techOutlineSections: normalizeOutlineGroups(project.techOutlineSections),
+      bizOutlineSections: normalizeOutlineGroups(project.bizOutlineSections),
     };
   }
 
   async updateOutline(projectId: string, dto: OutlineDto) {
+    const techOutlineSections =
+      dto.techOutlineSections !== undefined ? normalizeOutlineGroups(dto.techOutlineSections) : undefined;
+    const bizOutlineSections =
+      dto.bizOutlineSections !== undefined ? normalizeOutlineGroups(dto.bizOutlineSections) : undefined;
+
     await this.prisma.project.update({
       where: { id: projectId },
       data: {
         ...(dto.tenderOutline !== undefined && { tenderOutline: dto.tenderOutline }),
-        ...(dto.techOutlineSections !== undefined && { techOutlineSections: dto.techOutlineSections as object }),
-        ...(dto.bizOutlineSections !== undefined && { bizOutlineSections: dto.bizOutlineSections as object }),
+        ...(techOutlineSections !== undefined && { techOutlineSections: techOutlineSections as object }),
+        ...(bizOutlineSections !== undefined && { bizOutlineSections: bizOutlineSections as object }),
       },
     });
     return { success: true };

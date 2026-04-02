@@ -290,16 +290,74 @@ model TaskHistory {
 model Asset {
   id         String     @id @default(cuid())
   category   String
+  subtype    String?
   title      String
   fileUrl    String?    @map("file_url")
   content    String?    @db.Text
   snippet    String?    @db.Text
   tags       Json?
+  sourceMode String?    @default("manual") @map("source_mode")
+  metadata   Json?
+  ingestJobId String?   @map("ingest_job_id")
   uploadedBy String?    @map("uploaded_by")
   uploadedAt DateTime   @default(now()) @map("uploaded_at")
   updatedAt  DateTime   @updatedAt
 
-  documents  Document[]
+  documents      Document[]
+  ingestJob      LibraryIngestJob?   @relation("IngestJobAssets", fields: [ingestJobId], references: [id], onDelete: SetNull)
+  sourceForJobs  LibraryIngestJob[]  @relation("IngestSourceAsset")
+  archiveForJobs LibraryIngestJob[]  @relation("IngestArchiveAsset")
+  ingestItems    LibraryIngestItem[] @relation("IngestItemAsset")
+}
+
+model LibraryIngestJob {
+  id              String              @id @default(cuid())
+  sourceFileName  String              @map("source_file_name")
+  status          String
+  progress        Int                 @default(0)
+  archiveMirrored Boolean             @default(false) @map("archive_mirrored")
+  successCount    Int                 @default(0) @map("success_count")
+  unresolvedCount Int                 @default(0) @map("unresolved_count")
+  errorMessage    String?             @map("error_message") @db.Text
+  sourceAssetId   String?             @unique @map("source_asset_id")
+  archiveAssetId  String?             @unique @map("archive_asset_id")
+  createdBy       String?             @map("created_by")
+  completedAt     DateTime?           @map("completed_at")
+  createdAt       DateTime            @default(now())
+  updatedAt       DateTime            @updatedAt
+
+  assets      Asset[]             @relation("IngestJobAssets")
+  items       LibraryIngestItem[]
+  sourceAsset Asset?              @relation("IngestSourceAsset", fields: [sourceAssetId], references: [id], onDelete: SetNull)
+  archiveAsset Asset?             @relation("IngestArchiveAsset", fields: [archiveAssetId], references: [id], onDelete: SetNull)
+
+  @@index([status, createdAt])
+}
+
+model LibraryIngestItem {
+  id                String            @id @default(cuid())
+  jobId             String            @map("job_id")
+  status            String
+  targetCategory    String?           @map("target_category")
+  targetSubtype     String?           @map("target_subtype")
+  suggestedCategory String?           @map("suggested_category")
+  suggestedSubtype  String?           @map("suggested_subtype")
+  suggestedTitle    String?           @map("suggested_title")
+  finalTitle        String?           @map("final_title")
+  sourceQuote       String?           @map("source_quote") @db.Text
+  sourceOutline     String?           @map("source_outline")
+  content           String?           @db.Text
+  sourceBlockIds    Json?             @map("source_block_ids")
+  sourceChunkIds    Json?             @map("source_chunk_ids")
+  assetId           String?           @unique @map("asset_id")
+  metadata          Json?
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+
+  job   LibraryIngestJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  asset Asset?           @relation("IngestItemAsset", fields: [assetId], references: [id], onDelete: SetNull)
+
+  @@index([jobId, status])
 }
 
 model ReviewRecord {

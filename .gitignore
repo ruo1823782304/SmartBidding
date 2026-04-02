@@ -4,3 +4,17 @@ dist/
 .env
 .env.*
 backup-*/
+src/app/*.failed-restore-*
+~$*.docx
+.logs/
+.run/
+.vite-dev.err.log
+.vite-dev.out.log
+backend/.run/
+backend/local-storage/
+backend/tools/
+backend/.codex-backend.err.log
+backend/.codex-backend.out.log
+backend/.tmp-backend-*.log
+backend/scripts/__pycache__/
+src/.specstory/

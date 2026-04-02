@@ -1,6 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { existsSync } from 'fs';
-import { mkdir, readFile, writeFile } from 'fs/promises';
+import { mkdir, readFile, rm, writeFile } from 'fs/promises';
 import { Client } from 'minio';
 import * as path from 'path';
 import { Readable } from 'stream';
@@ -53,6 +53,25 @@ export class StorageService {
     }
   }
 
+  async deleteObject(bucket: string, key: string) {
+    if (bucket === 'local') {
+      await this.deleteLocalBuffer(key);
+      return;
+    }
+
+    try {
+      await this.client.removeObject(bucket, key);
+    } catch (error) {
+      const localPath = this.resolveLocalPath(key);
+      if (existsSync(localPath)) {
+        this.logger.warn(`MinIO delete failed, deleting local fallback: ${this.describeError(error)}`);
+        await this.deleteLocalBuffer(key);
+        return;
+      }
+      this.logger.warn(`Storage delete failed: ${this.describeError(error)}`);
+    }
+  }
+
   private async ensureBucket(bucket: string) {
     const exists = await this.client.bucketExists(bucket);
     if (!exists) {
@@ -69,6 +88,10 @@ export class StorageService {
 
   private async readLocalBuffer(key: string) {
     return readFile(this.resolveLocalPath(key));
+  }
+
+  private async deleteLocalBuffer(key: string) {
+    await rm(this.resolveLocalPath(key), { force: true }).catch(() => undefined);
   }
 
   private resolveLocalPath(key: string) {

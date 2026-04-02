@@ -17,7 +17,7 @@ interface DoclingCliOutput {
   blocks?: Array<{
     page_no?: number;
     block_type?: string;
-    section_path?: string;
+    section_path?: unknown;
     heading_level?: number;
     paragraph_no?: number;
     text?: string;
@@ -156,7 +156,7 @@ export class DoclingAdapterService {
         .map((block, index) => ({
           pageNo: block.page_no ?? 1,
           blockType: this.normalizeBlockType(block.block_type),
-          sectionPath: block.section_path ?? 'Unclassified',
+          sectionPath: this.normalizeSectionPath(block.section_path) ?? 'Unclassified',
           headingLevel: block.heading_level,
           paragraphNo: block.paragraph_no ?? index + 1,
           text: block.text!.trim(),
@@ -189,6 +189,58 @@ export class DoclingAdapterService {
       return normalized;
     }
     return 'PARAGRAPH';
+  }
+
+  private normalizeSectionPath(value: unknown): string | undefined {
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      if (!trimmed || this.isOpaqueSectionRef(trimmed)) {
+        return undefined;
+      }
+      return trimmed;
+    }
+
+    if (Array.isArray(value)) {
+      const parts = value
+        .map((item) => this.normalizeSectionPath(item))
+        .filter((item): item is string => Boolean(item));
+      return parts.length > 0 ? parts.join(' > ') : undefined;
+    }
+
+    if (value && typeof value === 'object') {
+      const record = value as Record<string, unknown>;
+      const preferredFields = ['path', 'sectionPath', 'title', 'label', 'name'];
+      for (const field of preferredFields) {
+        const normalized = this.normalizeSectionPath(record[field]);
+        if (normalized) {
+          return normalized;
+        }
+      }
+
+      try {
+        const serialized = JSON.stringify(value);
+        if (serialized === '{}' || /"#\/(?:body|groups|texts|tables|pages)/i.test(serialized)) {
+          return undefined;
+        }
+        return serialized;
+      } catch {
+        return undefined;
+      }
+    }
+
+    if (value === null || value === undefined) {
+      return undefined;
+    }
+
+    const primitive = String(value).trim();
+    if (!primitive || this.isOpaqueSectionRef(primitive)) {
+      return undefined;
+    }
+    return primitive;
+  }
+
+  private isOpaqueSectionRef(value: string) {
+    return /^#\/(?:body|groups|texts|tables|pages)(?:\/|$)/i.test(value.trim());
   }
 
   private extractFallbackDocument(fileName: string, ext: string, buffer: Buffer, parser: string): StructuredDocument {

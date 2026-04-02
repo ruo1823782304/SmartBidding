@@ -6,11 +6,13 @@ import {
   Param,
   Post,
   Query,
+  Res,
   UploadedFile,
   UseGuards,
   UseInterceptors,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
+import type { Response } from 'express';
 import { TenderService } from './tender.service';
 import { ParseTenderDto } from './dto/parse-tender.dto';
 import { GenerateOutlineDto } from './dto/generate-outline.dto';
@@ -51,6 +53,17 @@ export class TenderController {
   @Get('parse/items/:itemId/trace')
   async getParseItemTrace(@Param('itemId') itemId: string) {
     return this.tenderService.getParseItemTrace(itemId);
+  }
+
+  @Get('documents/:documentVersionId/source-file')
+  async getSourceFile(
+    @Param('documentVersionId') documentVersionId: string,
+    @Res() response: Response,
+  ) {
+    const sourceFile = await this.tenderService.getSourceFile(documentVersionId);
+    response.setHeader('Content-Type', sourceFile.mimeType);
+    response.setHeader('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(sourceFile.fileName)}`);
+    response.send(sourceFile.buffer);
   }
 
   @Post('outline/generate')

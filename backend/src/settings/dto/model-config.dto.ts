@@ -1,4 +1,59 @@
-import { IsString, IsOptional } from 'class-validator';
+import { Type } from 'class-transformer';
+import {
+  IsArray,
+  IsBoolean,
+  IsIn,
+  IsOptional,
+  IsString,
+  ValidateNested,
+} from 'class-validator';
+
+export class ModelProviderDto {
+  @IsString()
+  id!: string;
+
+  @IsString()
+  label!: string;
+
+  @IsString()
+  vendor!: string;
+
+  @IsString()
+  baseUrl!: string;
+
+  @IsString()
+  apiKey!: string;
+
+  @IsString()
+  model!: string;
+
+  @IsOptional()
+  @IsString()
+  @IsIn(['openai-chat', 'anthropic-messages', 'chat'])
+  wireApi?: 'openai-chat' | 'anthropic-messages' | 'chat';
+
+  @IsOptional()
+  @IsBoolean()
+  enabled?: boolean;
+}
+
+export class ModelTaskRoutingDto {
+  @IsOptional()
+  @IsString()
+  defaultProviderId?: string;
+
+  @IsOptional()
+  @IsString()
+  tenderParseProviderId?: string;
+
+  @IsOptional()
+  @IsString()
+  outlineGenerateProviderId?: string;
+
+  @IsOptional()
+  @IsString()
+  sectionGenerateProviderId?: string;
+}
 
 export class ModelConfigDto {
   @IsOptional()
@@ -7,21 +62,33 @@ export class ModelConfigDto {
 
   @IsOptional()
   @IsString()
-  selectedModel?: string;
+  codingPlanUrl?: string;
 
   @IsOptional()
   @IsString()
-  openaiKey?: string;
+  codingPlanApiKey?: string;
 
   @IsOptional()
   @IsString()
-  qwenKey?: string;
+  codingPlanAppId?: string;
+
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  supportedModels?: string[];
 
   @IsOptional()
   @IsString()
-  deepseekKey?: string;
+  activeProviderId?: string;
 
   @IsOptional()
-  @IsString()
-  baichuanKey?: string;
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => ModelProviderDto)
+  providers?: ModelProviderDto[];
+
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => ModelTaskRoutingDto)
+  taskRouting?: ModelTaskRoutingDto;
 }

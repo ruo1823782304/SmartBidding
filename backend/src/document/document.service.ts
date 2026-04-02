@@ -98,6 +98,79 @@ export class DocumentService {
     };
   }
 
+  async createAssetDocument(params: {
+    assetId: string;
+    title: string;
+    fileName: string;
+    mimeType?: string;
+    fileSize?: number;
+    storageBucket: string;
+    storageKey: string;
+    uploadedBy?: string;
+    fileBuffer: Buffer;
+    bizCategory?: DocumentBizCategory;
+    status?: DocumentStatus;
+  }) {
+    const existingDocument = await this.prisma.document.findFirst({
+      where: {
+        assetId: params.assetId,
+        documentType: DocumentType.ASSET,
+      },
+      orderBy: { createdAt: 'asc' },
+    });
+
+    const document =
+      existingDocument ??
+      (await this.prisma.document.create({
+        data: {
+          assetId: params.assetId,
+          documentType: DocumentType.ASSET,
+          bizCategory: params.bizCategory ?? DocumentBizCategory.OTHER,
+          title: params.title,
+          mimeType: params.mimeType,
+          fileExt: this.getExt(params.fileName),
+          createdBy: params.uploadedBy,
+          status: params.status ?? DocumentStatus.READY,
+        },
+      }));
+
+    const latestVersion = await this.prisma.documentVersion.findFirst({
+      where: { documentId: document.id },
+      orderBy: { versionNo: 'desc' },
+    });
+
+    const version = await this.prisma.documentVersion.create({
+      data: {
+        documentId: document.id,
+        versionNo: (latestVersion?.versionNo ?? 0) + 1,
+        storageBucket: params.storageBucket,
+        storageKey: params.storageKey,
+        fileName: params.fileName,
+        fileSize: params.fileSize,
+        contentHash: createHash('sha256').update(params.fileBuffer).digest('hex'),
+        createdBy: params.uploadedBy,
+        parseStatus: ParseJobStatus.PENDING,
+      },
+    });
+
+    await this.prisma.document.update({
+      where: { id: document.id },
+      data: {
+        title: params.title,
+        mimeType: params.mimeType,
+        fileExt: this.getExt(params.fileName),
+        currentVersionId: version.id,
+        status: params.status ?? DocumentStatus.READY,
+      },
+    });
+
+    return {
+      documentId: document.id,
+      documentVersionId: version.id,
+      versionNo: version.versionNo,
+    };
+  }
+
   async resolveTenderSource(projectId: string, fileId?: string) {
     const tenderFile = fileId
       ? await this.prisma.tenderFile.findFirst({
@@ -332,12 +405,13 @@ export class DocumentService {
 
       const persistedBlocks: PersistedBlockRef[] = [];
       for (const block of params.structured.blocks) {
+        const normalizedSectionPath = this.normalizeSectionPath(block.sectionPath);
         const createdBlock = await tx.documentBlock.create({
           data: {
             documentVersionId: params.documentVersionId,
             pageId: pageIdMap.get(block.pageNo),
             blockType: block.blockType as BlockType,
-            sectionPath: block.sectionPath,
+            sectionPath: normalizedSectionPath,
             headingLevel: block.headingLevel,
             paragraphNo: block.paragraphNo,
             text: block.text,
@@ -351,7 +425,7 @@ export class DocumentService {
           id: createdBlock.id,
           pageNo: block.pageNo,
           blockType: block.blockType,
-          sectionPath: block.sectionPath,
+          sectionPath: normalizedSectionPath ?? undefined,
           paragraphNo: block.paragraphNo,
           text: block.text,
         });
@@ -363,13 +437,14 @@ export class DocumentService {
 
       const persistedChunks: PersistedChunkRef[] = [];
       for (const chunk of params.chunks) {
+        const normalizedSectionPath = this.normalizeSectionPath(chunk.sectionPath);
         const createdChunk = await tx.documentChunk.create({
           data: {
             documentVersionId: params.documentVersionId,
             documentId: params.documentId,
             chunkType: chunk.chunkType as ChunkType,
             sourceBlockIds: chunk.sourceBlockIds.map((id) => blockIdMap.get(id) ?? id),
-            sectionPath: chunk.sectionPath,
+            sectionPath: normalizedSectionPath,
             pageStart: chunk.pageStart,
             pageEnd: chunk.pageEnd,
             text: chunk.text,
@@ -385,6 +460,7 @@ export class DocumentService {
         persistedChunks.push({
           ...chunk,
           id: createdChunk.id,
+          sectionPath: normalizedSectionPath ?? undefined,
           sourceBlockIds: chunk.sourceBlockIds.map((id) => blockIdMap.get(id) ?? id),
         });
       }
@@ -402,7 +478,13 @@ export class DocumentService {
     documentId: string;
     documentVersionId: string;
     summary: string;
+    status?: string;
+    modelProvider?: string;
+    modelName?: string;
+    promptVersion?: string;
+    schemaVersion?: string;
     items: Array<{
+      id?: string;
       majorCode: Prisma.ParseResultItemUncheckedCreateInput['majorCode'];
       minorCode: string;
       title: string;
@@ -436,11 +518,11 @@ export class DocumentService {
             projectId: params.projectId,
             documentId: params.documentId,
             documentVersionId: params.documentVersionId,
-            schemaVersion: 'tender-parse-v1',
-            promptVersion: 'pipeline-v1',
-            modelProvider: 'rule-based',
-            modelName: 'minimal-pipeline',
-            status: 'succeeded',
+            schemaVersion: params.schemaVersion ?? 'tender-parse-v1',
+            promptVersion: params.promptVersion ?? 'pipeline-v1',
+            modelProvider: params.modelProvider ?? 'rule-based',
+            modelName: params.modelName ?? 'minimal-pipeline',
+            status: params.status ?? 'succeeded',
             summary: params.summary,
           },
         }));
@@ -450,17 +532,31 @@ export class DocumentService {
           where: { id: existing.id },
           data: {
             summary: params.summary,
-            status: 'succeeded',
+            status: params.status ?? 'succeeded',
+            schemaVersion: params.schemaVersion ?? existing.schemaVersion,
+            promptVersion: params.promptVersion ?? existing.promptVersion,
+            modelProvider: params.modelProvider ?? existing.modelProvider,
+            modelName: params.modelName ?? existing.modelName,
           },
         });
       }
 
       if (params.items.length > 0) {
         await tx.parseResultItem.createMany({
-          data: params.items.map((item) => ({
-            parseResultId: parseResult.id,
-            ...item,
-          })),
+          data: params.items.map((item) => {
+            const { id, ...rest } = item;
+            return {
+              ...rest,
+              id:
+                id ??
+                this.buildStableParseResultItemId(
+                  params.parseJobId,
+                  String(item.majorCode),
+                  item.minorCode,
+                ),
+              parseResultId: parseResult.id,
+            };
+          }),
         });
       }
 
@@ -470,6 +566,50 @@ export class DocumentService {
 
   private estimateTokens(text: string) {
     return Math.max(1, Math.ceil(text.length / 2));
+  }
+
+  private buildStableParseResultItemId(parseJobId: string, majorCode: string, minorCode: string) {
+    const hash = createHash('sha1').update(`${parseJobId}:${majorCode}:${minorCode}`).digest('hex');
+    return `pri_${hash}`;
+  }
+
+  private normalizeSectionPath(value: unknown): string | null {
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      return trimmed || null;
+    }
+
+    if (Array.isArray(value)) {
+      const parts = value
+        .map((item) => this.normalizeSectionPath(item))
+        .filter((item): item is string => Boolean(item));
+      return parts.length > 0 ? parts.join(' > ') : null;
+    }
+
+    if (value && typeof value === 'object') {
+      const record = value as Record<string, unknown>;
+      const preferredFields = ['path', 'sectionPath', 'title', 'label', 'name', 'cref'];
+      for (const field of preferredFields) {
+        const normalized = this.normalizeSectionPath(record[field]);
+        if (normalized) {
+          return normalized;
+        }
+      }
+
+      try {
+        const serialized = JSON.stringify(value);
+        return serialized === '{}' ? null : serialized;
+      } catch {
+        return null;
+      }
+    }
+
+    if (value === null || value === undefined) {
+      return null;
+    }
+
+    const primitive = String(value).trim();
+    return primitive || null;
   }
 
   private getExt(fileName: string) {

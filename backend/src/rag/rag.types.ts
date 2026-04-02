@@ -93,4 +93,18 @@ export interface ParseResultItemDraft {
 export interface ParseResultDraft {
   summary: string;
   items: ParseResultItemDraft[];
+  modelProvider?: string;
+  modelName?: string;
+  promptVersion?: string;
+  schemaVersion?: string;
+}
+
+export interface ParseResultProgressSnapshot extends ParseResultDraft {
+  latestMajorCode: MajorParseCode;
+  completedCategories: number;
+  totalCategories: number;
+}
+
+export interface BuildParseResultOptions {
+  onCategoryComplete?: (snapshot: ParseResultProgressSnapshot) => Promise<void> | void;
 }
